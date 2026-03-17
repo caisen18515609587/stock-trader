@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  日志配置说明：
+  - 日志目录默认为 ./logs，可通过 JVM 参数 -DLOG_DIR=/your/path 覆盖
+  - 按日轮转，主日志保留 30 天，交易日志保留 90 天，错误日志保留 60 天
+  - 单文件超过 100MB 自动切割，总占用不超过 2GB（主日志）
+  - 控制台日志级别由 JVM 参数 -DCONSOLE_LOG_LEVEL 控制（默认 INFO，生产可设为 WARN）
+-->
+<configuration scan="true" scanPeriod="60 seconds">
+
+    <!-- ==================== 属性定义 ==================== -->
+    <!-- 日志根目录：优先读取 JVM 参数 -DLOG_DIR，否则使用默认值 -->
+    <property name="LOG_DIR"  value="${LOG_DIR:-./logs}"/>
+    <property name="APP_NAME" value="stock-trader"/>
+
+    <!-- ==================== 控制台 Appender ==================== -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <!-- 控制台级别可通过 JVM 参数 -DCONSOLE_LOG_LEVEL=WARN 降噪 -->
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>${CONSOLE_LOG_LEVEL:-INFO}</level>
+        </filter>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ==================== 主日志 Appender（按日轮转 + 大小切割）==================== -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <!-- 当前日志文件（无日期后缀，方便 tail -f） -->
+        <file>${LOG_DIR}/${APP_NAME}.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <!-- 轮转后的文件命名：按日 + 序号（单日超 100MB 则序号递增） -->
+            <fileNamePattern>${LOG_DIR}/${APP_NAME}.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <!-- 单个归档文件最大 100MB -->
+            <maxFileSize>100MB</maxFileSize>
+            <!-- 保留最近 30 天的归档 -->
+            <maxHistory>30</maxHistory>
+            <!-- 所有归档总大小上限 2GB（超出时删除最旧的） -->
+            <totalSizeCap>2GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{50} - %msg%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ==================== 错误日志 Appender（单独归档，方便告警）==================== -->
+    <appender name="ERROR_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/${APP_NAME}-error.log</file>
+        <!-- 只记录 ERROR 及以上 -->
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>ERROR</level>
+        </filter>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/${APP_NAME}-error.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <maxFileSize>50MB</maxFileSize>
+            <!-- 错误日志保留 60 天（需要更长时间排查问题） -->
+            <maxHistory>60</maxHistory>
+            <totalSizeCap>500MB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{50} - %msg%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ==================== 交易日志 Appender（高价值，保留更久）==================== -->
+    <appender name="TRADE_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/trade.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/trade.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <maxFileSize>50MB</maxFileSize>
+            <!-- 交易日志保留 90 天（对账/审计需要） -->
+            <maxHistory>90</maxHistory>
+            <totalSizeCap>1GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <!-- 交易日志格式精简：时间 + 消息，便于后续解析 -->
+            <pattern>%d{yyyy-MM-dd HH:mm:ss} %msg%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ==================== 推送日志 Appender（单独归档，方便排查推送问题）==================== -->
+    <appender name="PUSH_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/push.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/push.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <maxFileSize>20MB</maxFileSize>
+            <!-- 推送日志保留 30 天 -->
+            <maxHistory>30</maxHistory>
+            <totalSizeCap>200MB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{50} - %msg%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ==================== Logger 配置 ==================== -->
+
+    <!-- 交易模块：写入交易日志（同时也输出到主日志，additivity=true） -->
+    <logger name="com.stocktrader.trading" level="INFO" additivity="true">
+        <appender-ref ref="TRADE_FILE"/>
+    </logger>
+
+    <!-- 策略模块：写入交易日志（信号产生也属于交易关键事件） -->
+    <logger name="com.stocktrader.strategy" level="INFO" additivity="true">
+        <appender-ref ref="TRADE_FILE"/>
+    </logger>
+
+    <!-- 推送模块：单独写入推送日志 -->
+    <logger name="com.stocktrader.util.WechatPushService"  level="INFO" additivity="true">
+        <appender-ref ref="PUSH_FILE"/>
+    </logger>
+    <logger name="com.stocktrader.util.WechatTemplateService" level="INFO" additivity="true">
+        <appender-ref ref="PUSH_FILE"/>
+    </logger>
+    <logger name="com.stocktrader.util.CallbackServer"   level="INFO" additivity="true">
+        <appender-ref ref="PUSH_FILE"/>
+    </logger>
+
+    <!-- 第三方库静噪（避免刷日志） -->
+    <logger name="org.apache.http"     level="WARN"/>
+    <logger name="com.alibaba.fastjson" level="WARN"/>
+
+    <!-- ==================== 根日志 ==================== -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE"/>
+        <appender-ref ref="ERROR_FILE"/>
+    </root>
+
+</configuration>
+
