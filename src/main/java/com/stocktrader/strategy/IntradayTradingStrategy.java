@@ -392,11 +392,20 @@ public class IntradayTradingStrategy implements TradingStrategy {
         return upCount >= 2;
     }
 
-    /** 计算止损价（ATR动态止损与固定止损取较紧者） */
+    /** 计算止损价（ATR动态止损与固定止损取较紧者）
+     * [P1-2] 自适应ATR倍数：低波动股(ATR%<=1%)用2.5倍，中波动用1.5倍，高波动(ATR%>2.5%)用1.2倍
+     */
     private double calcStopPrice(List<StockBar> bars, double cost) {
         double fixedStop = cost * (1 - stopLossPercent);
         if (bars.size() >= 14) {
-            double atrStop = AtrStopLoss.calcStopPrice(bars, cost, 14, 1.5);
+            // [P1-2] 根据ATR%动态选择倍数
+            double atrPct = AtrStopLoss.atrPercent(bars, 14) * 100;
+            double multiplier;
+            if (atrPct <= 0)         multiplier = 1.5; // 无法计算时用默认值
+            else if (atrPct <= 1.0)  multiplier = 2.5; // 低波动：宽止损，避免正常波动触发
+            else if (atrPct <= 2.5)  multiplier = 1.5; // 中波动：标准配置
+            else                     multiplier = 1.2; // 高波动：收紧止损，防单笔大亏
+            double atrStop = AtrStopLoss.calcStopPrice(bars, cost, 14, multiplier);
             return Math.max(atrStop, fixedStop); // 取较高者（更紧的止损）
         }
         return fixedStop;

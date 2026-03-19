@@ -267,6 +267,15 @@ public class StockScreener {
         List<ScreenResult> results = analyzeWithKline(candidates, minScore);
         log.info("技术分析完成，符合条件（评分>={})：{}只", minScore, results.size());
 
+        // [P3-1 ROE硬过滤] 技术面分析完成后，对候选股做轻量ROE质量门槛过滤
+        // 即使在纯技术面模式（screen.fundamental.enabled=false）下也执行，
+        // 确保选出的股票具备基本的盈利能力（ROE>=roeMin），排除持续亏损或低质量股。
+        // 安全降级：当ROE数据为0（积分不足/数据缺失）时不过滤，防止误杀。
+        double roeMin = com.stocktrader.config.SystemConfig.getInstance().getFundamentalRoeMin();
+        if (roeMin > 0 && !results.isEmpty()) {
+            results = applyRoeHardFilter(results, roeMin);
+        }
+
         // Step4: 排序，取Top N
         Collections.sort(results);
         List<ScreenResult> topList = results.stream().limit(topN).collect(Collectors.toList());
@@ -277,6 +286,59 @@ public class StockScreener {
             log.info("  第{}名: {} {} 评分{}", i + 1, r.stockCode, r.stockName, r.techScore);
         }
         return topList;
+    }
+
+    /**
+     * [P3-1] ROE 硬过滤：对技术面候选股批量查询ROE，排除低盈利能力股票
+     * <p>
+     * 设计原则：
+     * 1. 仅当ROE数据有效（>0）时才执行过滤，数据为0（积分不足/接口异常）时放行（防误杀）。
+     * 2. 批量查询，1次HTTP请求获取所有候选股ROE，不影响选股速度。
+     * 3. 过滤门槛默认8%（低于ROE=8%的股票盈利能力弱，长期来看股价上涨动力不足）。
+     *    注：配置项 screen.fundamental.roe.min 默认10%（可在 application.properties 中调整）。
+     *
+     * @param results 技术面候选股列表
+     * @param roeMin  ROE最低阈值（%），如8.0表示8%
+     * @return 过滤后的候选股列表
+     */
+    private List<ScreenResult> applyRoeHardFilter(List<ScreenResult> results, double roeMin) {
+        try {
+            List<String> codes = results.stream().map(r -> r.stockCode).collect(Collectors.toList());
+            Map<String, String> nameMap = new LinkedHashMap<>();
+            results.forEach(r -> nameMap.put(r.stockCode, r.stockName));
+
+            // 批量查询基本面（ROE），1次HTTP请求
+            Map<String, FundamentalFactor> fundMap =
+                    fundamentalProvider.getBatchFundamental(codes, nameMap);
+
+            List<ScreenResult> filtered = new ArrayList<>();
+            int filteredCount = 0;
+            for (ScreenResult r : results) {
+                FundamentalFactor f = fundMap.get(r.stockCode);
+                if (f != null && f.getRoe() > 0 && f.getRoe() < roeMin) {
+                    // ROE数据有效且低于阈值，排除
+                    log.debug("[P3-1 ROE过滤] {} {} ROE={}% < {}%，排除",
+                            r.stockCode, r.stockName,
+                            String.format("%.1f", f.getRoe()),
+                            String.format("%.0f", roeMin));
+                    filteredCount++;
+                } else {
+                    filtered.add(r);
+                }
+            }
+            if (filteredCount > 0) {
+                log.info("[P3-1 ROE过滤] ROE<{}% 排除{}只，剩余{}只候选",
+                        String.format("%.0f", roeMin), filteredCount, filtered.size());
+            } else {
+                log.debug("[P3-1 ROE过滤] ROE<{}% 无股票被排除（候选{}只均达标或数据缺失）",
+                        String.format("%.0f", roeMin), results.size());
+            }
+            return filtered;
+        } catch (Exception e) {
+            // 接口异常时安全降级：不过滤，返回原始列表
+            log.warn("[P3-1 ROE过滤] 批量查询ROE失败，降级跳过过滤: {}", e.getMessage());
+            return results;
+        }
     }
 
     /**

@@ -194,8 +194,16 @@ public class AutoTrader {
      * 每个新交易日开始时（refreshDailyBaseline）自动清空。
      */
     private final Set<String> candidateQualifyDaySeen = new java.util.HashSet<>();
-    /** 换入候选股连续达标最少交易日数（2个不同交易日）*/
-    private static final int SWAP_MIN_QUALIFY_DAYS = 2;
+    /**
+     * 换入候选股连续达标最少交易日数（[P2-2 优化] 由2天提升至3天）
+     * <p>
+     * 原因：2天达标门槛过低，偶然拉升一两天即可触发换仓，导致：
+     *   1. 换仓后标的往往已是短期高点（追涨），缺乏上涨空间
+     *   2. 手续费（双向约0.25%）侵蚀换仓收益
+     * 提升到3天：候选股需连续3个交易日评分达标才允许换入，
+     *   确保是真正的持续强势而非短暂脉冲，降低"追高后回调"的换仓损耗。
+     */
+    private static final int SWAP_MIN_QUALIFY_DAYS = 3;
 
     // ===== 大盘择时过滤 =====
     /** 上证指数代码（用于大盘趋势判断） */
@@ -223,6 +231,18 @@ public class AutoTrader {
     private static final int MARKET_BEARISH_STRONG_SIGNAL_THRESHOLD = 85;
     /** 大盘MA5下穿MA20（空头排列）时暂停新开仓标志 */
     private volatile boolean marketBearish = false;
+    /**
+     * [P0-2 优化] 深度熊市标志：MA5 < MA20 < MA60（三线空头排列）
+     * <p>
+     * 区别于普通弱势（marketBearish，MA5<MA20）：
+     *   - 普通弱势（MA5<MA20）：仅拦截低质量新开仓（强度<85的信号被拦），允许换仓
+     *   - 深度熊市（MA5<MA20<MA60）：同时禁止换仓操作（tryPositionSwap 返回），
+     *     因为换仓会先卖出持仓（锁定亏损），再买入新股（高概率继续亏损），
+     *     在趋势性下跌行情中极易形成"越换越亏"的死亡螺旋。
+     * <p>
+     * 解锁条件：MA5 >= MA20 或 MA20 >= MA60（任意一条均线恢复正排列）。
+     */
+    private volatile boolean marketDeepBearish = false;
     /** 大盘择时状态最后更新时间（毫秒，避免每次买入都重新拉行情）*/
     private volatile long marketStatusLastUpdate = 0L;
     /** 大盘择时状态缓存有效期（5分钟）*/
@@ -862,6 +882,41 @@ public class AutoTrader {
                     effectiveStopPrice);
         }
 
+        // ===== [P2-1 优化] 移动止盈保本止损：盈利>5%后止损线上移到成本价 =====
+        // 原理：当盈利已积累>5%时，不应再允许亏损止损出局。
+        //   将止损线从「成本×(1-止损比例)」上移到「成本价」（保本线），
+        //   这样即使股价回调，最多保本出局，已锁定>5%浮盈不再全部损失。
+        // 分级逻辑：
+        //   - 盈利 > 8%（高位）：止损线上移到成本×1.03（锁定3%利润，追踪更激进）
+        //   - 盈利 5%~8%（中位）：止损线上移到成本×1.00（至少保本，不亏损）
+        //   - 盈利 < 5%（普通）：保持原止损线（ATR/固定），正常止损逻辑
+        // 豁免：次日开盘保护窗口内不启用（避免开盘跳空低开触发保本止损）
+        if (!isOpeningProtectWindow) {
+            double breakEvenStop = avgCost; // 保本线
+            double lockProfitStop = avgCost * 1.03; // 锁利3%线
+            if (profitRate > 0.08 && currentPrice > lockProfitStop) {
+                // 高位盈利：止损线上移到锁利3%位
+                if (effectiveStopPrice < lockProfitStop) {
+                    effectiveStopPrice = lockProfitStop;
+                    stopLossTag = String.format("高位锁利止损=%.2f（盈利=%.1f%%>8%%，止损上移到成本+3%%）",
+                            effectiveStopPrice, profitRate * 100);
+                    log.debug("[保本止损] {} 盈利={}%>8%，止损线上移到锁利位={}", code,
+                            String.format("%.1f", profitRate * 100),
+                            String.format("%.2f", effectiveStopPrice));
+                }
+            } else if (profitRate > 0.05 && currentPrice > breakEvenStop) {
+                // 中位盈利：止损线上移到成本价（保本）
+                if (effectiveStopPrice < breakEvenStop) {
+                    effectiveStopPrice = breakEvenStop;
+                    stopLossTag = String.format("保本止损=%.2f（盈利=%.1f%%>5%%，止损上移到成本价保本）",
+                            effectiveStopPrice, profitRate * 100);
+                    log.debug("[保本止损] {} 盈利={}%>5%，止损线上移到保本位={}", code,
+                            String.format("%.1f", profitRate * 100),
+                            String.format("%.2f", effectiveStopPrice));
+                }
+            }
+        }
+
         if (currentPrice <= effectiveStopPrice) {
             log.warn("[快速止损触发] {} {} 成本={} 现价={} 止损价={} 亏损={}%，立即止损！（{}）",
                     code, stockName,
@@ -1183,10 +1238,12 @@ public class AutoTrader {
             // 判断条件2：[P2-2] 上证指数 MA5<MA20 且 沪深300 MA5<MA20（双指数交叉验证）
             // 仅当两个指数均为空头排列时才触发，降低单指数噪音导致的误触发率
             boolean ma5BelowMa20 = false;
+            // [P0-2] 提升到 try 块外，供后续 marketDeepBearish 赋值使用
+            boolean sh000001DeepBearish = false; // MA5<MA20<MA60 三线空头
             try {
                 LocalDate endDate = LocalDate.now();
                 LocalDate startDate = endDate.minusMonths(3);
-                // 上证指数 MA 判断
+                // 上证指数 MA 判断（含 MA60 深度熊市检测）
                 boolean sh000001Bearish = false;
                 List<StockBar> indexBars = dataProvider.getDailyBars(
                         MARKET_INDEX_CODE, startDate, endDate, StockBar.AdjustType.NONE);
@@ -1197,6 +1254,13 @@ public class AutoTrader {
                     double ma20 = com.stocktrader.analysis.TechnicalIndicator.sma(closes, 20);
                     if (ma5 > 0 && ma20 > 0) {
                         sh000001Bearish = ma5 < ma20;
+                        // [P0-2] 计算 MA60：三线空头排列检测
+                        if (sh000001Bearish && closes.size() >= 60) {
+                            double ma60 = com.stocktrader.analysis.TechnicalIndicator.sma(closes, 60);
+                            if (ma60 > 0) {
+                                sh000001DeepBearish = ma20 < ma60; // MA5<MA20 已满足，再加 MA20<MA60
+                            }
+                        }
                     }
                 }
                 // [P2-2] 沪深300交叉验证：仅当上证也弱时才请求沪深300，减少不必要请求
@@ -1231,9 +1295,15 @@ public class AutoTrader {
 
             cachedIndexChangePct = changePct;
             marketBearish = todayBigDrop || ma5BelowMa20;
+            // [P0-2] 深度熊市：MA5<MA20<MA60（三线空头排列），同时禁止换仓
+            // 条件：必须满足 ma5BelowMa20（双指数已验证弱势）且上证 MA20<MA60
+            marketDeepBearish = ma5BelowMa20 && sh000001DeepBearish;
             marketStatusLastUpdate = now;
 
-            if (marketBearish) {
+            if (marketDeepBearish) {
+                log.warn("[大盘择时-深度熊市] MA5<MA20<MA60 三线空头排列！当日涨跌幅={}%，暂停新开仓+禁止换仓",
+                        String.format("%.2f", changePct));
+            } else if (marketBearish) {
                 log.info("[大盘择时] 大盘风险预警：当日涨跌幅={} %，双指数MA5{}MA20，暂停新开仓",
                         String.format("%.2f", changePct), ma5BelowMa20 ? "<" : ">=");
             }
@@ -1662,6 +1732,38 @@ public class AutoTrader {
             }
         }
 
+        // ===== [P1-3 优化] 动量高位反转过滤：20日涨幅>15%不买（追涨高位风险极高）=====
+        // 背景：20日涨幅>15%（约等于3个交易周内上涨15%）属于短期动量高位，
+        //   均值回归效应显著，追入后往往伴随强烈回调（即"追涨杀跌"现象）。
+        //   历史成交数据显示，追入20日涨幅>15%股票的止损率明显高于普通标的。
+        // 豁免：加仓信号不受此限制；竞价封板策略不受此限制（其买入逻辑本身就是追涨）。
+        if (!isAddPositionSignal && !(strategy instanceof com.stocktrader.strategy.AuctionLimitUpStrategy)) {
+            try {
+                LocalDate endDate20 = LocalDate.now();
+                LocalDate startDate20 = endDate20.minusMonths(2);
+                List<StockBar> bars20 = dataProvider.getDailyBars(code, startDate20, endDate20, StockBar.AdjustType.FORWARD);
+                if (bars20 != null && bars20.size() >= 20) {
+                    // 取最近20根K线（倒数第21根为20日前的收盘价）
+                    int sz20 = bars20.size();
+                    double price20dAgo = bars20.get(sz20 - 21 >= 0 ? sz20 - 21 : 0).getClose();
+                    double priceNow    = bars20.get(sz20 - 1).getClose();
+                    if (price20dAgo > 0) {
+                        double gain20d = (priceNow - price20dAgo) / price20dAgo * 100;
+                        // 科创板/创业板（±20%涨跌幅）适当放宽阈值至20%
+                        boolean isHighLimitBoard20 = code.startsWith("688") || code.startsWith("300");
+                        double gain20dLimit = isHighLimitBoard20 ? 20.0 : 15.0;
+                        if (gain20d > gain20dLimit) {
+                            log.info("[高位反转过滤] {} 近20日涨幅={}%，超过{}%高位阈值，拒绝买入（防追涨高位均值回归）",
+                                    code, String.format("%.1f", gain20d), (int) gain20dLimit);
+                            return;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("[高位反转过滤] {} 获取K线数据失败，跳过20日涨幅检查: {}", code, e.getMessage());
+            }
+        }
+
         // ===== 板块止损保护：当日止损过的行业禁止再买入同行业股票 =====
         // 豁免：加仓信号不受此限制（持仓内股票加仓由策略独立判断，不应因同行业他股止损而拦截）
         if (!isAddPositionSignal && !stopLossIndustriesToday.isEmpty()) {
@@ -1675,6 +1777,38 @@ public class AutoTrader {
                 }
             } catch (Exception e) {
                 log.debug("[板块保护] 获取 {} 行业信息失败，跳过行业检查: {}", code, e.getMessage());
+            }
+        }
+
+        // ===== [P1-1 优化] 行业分散约束：持仓中同行业不超过1只 =====
+        // 目的：防止账户被单一行业板块集中踩雷，降低板块系统性风险的暴露。
+        // 逻辑：买入前检查当前持仓，若已有同行业股票则拒绝买入新的同行业股。
+        // 豁免：加仓信号不受此限制（对已持仓的同行业股加仓属于策略正常行为）。
+        if (!isAddPositionSignal && !portfolio.getPositions().isEmpty()) {
+            try {
+                com.stocktrader.model.Stock newStockInfo = dataProvider.getStockInfo(code);
+                if (newStockInfo != null && newStockInfo.getIndustry() != null
+                        && !newStockInfo.getIndustry().isEmpty()) {
+                    String newIndustry = newStockInfo.getIndustry();
+                    // 遍历当前持仓，检查是否已有同行业
+                    for (Position existingPos : portfolio.getPositions().values()) {
+                        if (existingPos.getStockCode().equals(code)) continue; // 跳过自身
+                        try {
+                            com.stocktrader.model.Stock existingInfo =
+                                    dataProvider.getStockInfo(existingPos.getStockCode());
+                            if (existingInfo != null && newIndustry.equals(existingInfo.getIndustry())) {
+                                log.info("[行业分散] {} 行业「{}」已持有同行业股票 {} {}，拒绝买入（同行业持仓上限1只）",
+                                        code, newIndustry,
+                                        existingPos.getStockCode(), existingPos.getStockName());
+                                return;
+                            }
+                        } catch (Exception ignored) {
+                            // 获取已持仓股行业信息失败时跳过该持仓，不因此阻断新买入
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("[行业分散] {} 获取行业信息失败，跳过行业分散检查: {}", code, e.getMessage());
             }
         }
 
@@ -1841,6 +1975,13 @@ public class AutoTrader {
             // 止损：全部卖出，并更新冷却期起点时间（防止止损后立即追高）
             lastStopLossTimeMs = System.currentTimeMillis();
             log.debug("[止损冷却] 止损卖出 {}，冷却期 {} 小时内禁止新开仓", code, STOP_LOSS_COOLDOWN_MS / 3600000);
+            // [P0-1 优化] 止损后立即强制刷新大盘状态：
+            // 将大盘缓存时间戳重置为0，使下次 processBuySignal() 必须重新拉取大盘行情。
+            // 背景：止损往往因为盘面突变，此时大盘很可能已进入弱势；
+            //   若不强制刷新，5分钟缓存期内系统仍用旧的"大盘健康"状态判断，继续放行买入信号，
+            //   导致"止损→换仓→再止损"的连续亏损循环。
+            marketStatusLastUpdate = 0L;
+            log.info("[P0-1止损刷新] {} 止损触发，强制过期大盘状态缓存，下次买入前将重新判断大盘健康度", code);
             // 记录止损日期到重入保护表（至少 STOP_LOSS_REENTRY_MIN_DAYS 个交易日后才允许重入同一标的）
             stopLossReentryMap.put(code, LocalDate.now());
             log.debug("[重入保护] 止损卖出 {}，记录止损日 {}，至少 {} 个交易日后才允许重入",
@@ -1973,6 +2114,15 @@ public class AutoTrader {
             return;
         }
 
+        // [P0-2 优化] 深度熊市（MA5<MA20<MA60）全面禁止换仓
+        // 原因：在趋势性下跌行情中，换仓 = 先卖（锁定亏损）+ 再买（大概率继续亏损），
+        //   形成"越换越亏"的死亡螺旋。与其主动换仓，不如守住现有仓位等待趋势反转。
+        // 注意：isMarketBearishNow() 有5分钟缓存，此处直接用已缓存的标志位，不额外调用。
+        if (marketDeepBearish) {
+            log.info("[置换跳过-深度熊市] MA5<MA20<MA60 三线空头排列，深度熊市禁止换仓操作，避免越换越亏");
+            return;
+        }
+
         // 本轮已执行的置换次数
         int swapCount = 0;
         // 每次置换后，剩余候选信号池（已置换过的从池中移除）
@@ -2089,6 +2239,36 @@ public class AutoTrader {
             if (bestNewSignal == null) {
                 log.debug("[置换跳过] 无符合条件的新股候选（趋势或冷却期过滤后为空）");
                 break;
+            }
+
+            // ===== [P2-3 优化] Step B+：5分钟K线方向确认 =====
+            // 目的：换仓是高成本操作（双边手续费约0.25%），必须确认候选股日内也在向上运行，
+            //   而非日线虽然多头但盘中正在走弱（日内卖压重，换入后立即被继续拉低）。
+            // 条件：最新5分钟K线非阴线 且 近3根5分钟K线收盘价非连续下行
+            // 豁免：无法获取5分钟数据时不阻断换仓（降级为仅靠日线判断）
+            if (strategy instanceof DayTradingStrategy || strategy instanceof IntradayTradingStrategy) {
+                String swapCandCode = bestNewSignal.getStockCode();
+                try {
+                    List<StockBar> swapMin5 = dataProvider.getMinuteBars(swapCandCode, StockBar.BarPeriod.MIN_5, 10);
+                    if (swapMin5 != null && swapMin5.size() >= 4) {
+                        int m5sz = swapMin5.size();
+                        StockBar latestM5 = swapMin5.get(m5sz - 1);
+                        boolean latestIsDown = latestM5.getClose() < latestM5.getOpen();
+                        // 近3根5分钟K线连续下行
+                        boolean continuousM5Down = m5sz >= 3
+                                && swapMin5.get(m5sz - 1).getClose() < swapMin5.get(m5sz - 2).getClose()
+                                && swapMin5.get(m5sz - 2).getClose() < swapMin5.get(m5sz - 3).getClose();
+                        if (latestIsDown && continuousM5Down) {
+                            log.info("[置换过滤-5分钟线] {} 换仓候选股5分钟线阴线且近3根连续下行，日内趋势偏弱，跳过本轮换仓（等待日内趋势好转）",
+                                    swapCandCode);
+                            // 将此候选从本轮候选池移除，不影响下次扫描
+                            remainingCandidates.remove(swapCandCode);
+                            continue;
+                        }
+                    }
+                } catch (Exception e) {
+                    log.debug("[置换过滤-5分钟线] {} 获取5分钟K线失败，跳过分钟线确认: {}", swapCandCode, e.getMessage());
+                }
             }
 
             // ===== Step C：评分优势判断 =====

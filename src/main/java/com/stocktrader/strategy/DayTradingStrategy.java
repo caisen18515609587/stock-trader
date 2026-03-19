@@ -133,13 +133,15 @@ public class DayTradingStrategy implements TradingStrategy {
             String stopDesc;
             if (useAtrStop && bars.size() >= atrPeriod + 1) {
                 // 短线：直接用入场价 - N×ATR（不用吊灯，做T不需要跟踪最高价）
-                double atrStopPrice = AtrStopLoss.calcStopPrice(bars, avgCost, atrPeriod, atrMultiplier);
+                // [P1-2] 使用自适应ATR倍数：低波动用2.5倍，高波动用1.2倍
+                double adaptiveMultiplier = adaptiveAtrMultiplier(bars);
+                double atrStopPrice = AtrStopLoss.calcStopPrice(bars, avgCost, atrPeriod, adaptiveMultiplier);
                 double fixedStopPrice = avgCost * (1 - stopLossPercent);
                 // 取较高者（止损更紧）
                 effectiveStopPrice = Math.max(atrStopPrice, fixedStopPrice);
                 double atrPct = AtrStopLoss.atrPercent(bars, atrPeriod) * 100;
-                stopDesc = String.format("ATR动态止损=%.2f（ATR=%.1f%%×%.1f，ATR止损=%.2f，固定=%.2f）",
-                        effectiveStopPrice, atrPct, atrMultiplier, atrStopPrice, fixedStopPrice);
+                stopDesc = String.format("ATR动态止损=%.2f（ATR=%.1f%%×%.1f自适应，ATR止损=%.2f，固定=%.2f）",
+                        effectiveStopPrice, atrPct, adaptiveMultiplier, atrStopPrice, fixedStopPrice);
             } else {
                 effectiveStopPrice = avgCost * (1 - stopLossPercent);
                 stopDesc = String.format("固定止损=%.2f（%.0f%%）", effectiveStopPrice, stopLossPercent * 100);
@@ -451,12 +453,13 @@ public class DayTradingStrategy implements TradingStrategy {
             double posRatio = strength >= 80 ? maxPositionRatio
                     : (strength >= 70 ? maxPositionRatio * 0.7 : maxPositionRatio * 0.5);
 
-            // ATR 初始止损价
+            // ATR 初始止损价 [P1-2] 使用自适应ATR倍数
+            double adaptiveMultiplierForBuy = adaptiveAtrMultiplier(bars);
             double atrStopPrice = (useAtrStop && bars.size() >= atrPeriod + 1)
-                    ? AtrStopLoss.calcStopPrice(bars, currentPrice, atrPeriod, atrMultiplier)
+                    ? AtrStopLoss.calcStopPrice(bars, currentPrice, atrPeriod, adaptiveMultiplierForBuy)
                     : currentPrice * (1 - stopLossPercent);
             String stopLabel = useAtrStop
-                    ? String.format("ATR×%.1f止损=%.2f", atrMultiplier, atrStopPrice)
+                    ? String.format("ATR×%.1f自适应止损=%.2f", adaptiveMultiplierForBuy, atrStopPrice)
                     : String.format("固定%.0f%%止损=%.2f", stopLossPercent * 100, atrStopPrice);
 
             return TradeSignal.builder()
@@ -484,6 +487,30 @@ public class DayTradingStrategy implements TradingStrategy {
         if (signal.getStrength() >= 80) return maxPositionRatio;
         if (signal.getStrength() >= 70) return maxPositionRatio * 0.7;
         return maxPositionRatio * 0.5;
+    }
+
+    /**
+     * [P1-2 优化] 根据 ATR% 动态选择 ATR 倍数
+     * <p>
+     * 背景：固定 ATR 倍数对不同波动率股票效果差异极大：
+     *   - 低波动股（ATR%<1%，如银行/公用事业）：止损太宽 → 1.5倍ATR可能离入场价仅0.5%，不起作用
+     *   - 高波动股（ATR%>3%，如题材小盘股）：止损太宽 → 1.5倍ATR即达5%，会被正常波动洗出
+     * <p>
+     * 差异化倍数策略：
+     *   - ATR% <= 1.0%（低波动）：用 2.5 倍，给止损更多空间，避免被正常回调洗出
+     *   - ATR% 1.0%~2.5%（中等波动）：用配置的 atrMultiplier（默认1.5倍）
+     *   - ATR% > 2.5%（高波动）：用 1.2 倍，收紧止损，防止高波动股单笔亏损过大
+     *
+     * @param bars K线数据
+     * @return 适合当前股票波动率的 ATR 倍数
+     */
+    private double adaptiveAtrMultiplier(List<StockBar> bars) {
+        if (!useAtrStop || bars == null || bars.size() < atrPeriod) return atrMultiplier;
+        double atrPct = AtrStopLoss.atrPercent(bars, atrPeriod) * 100;
+        if (atrPct <= 0) return atrMultiplier;
+        if (atrPct <= 1.0) return 2.5;        // 低波动：宽止损
+        if (atrPct <= 2.5) return atrMultiplier; // 中波动：默认
+        return 1.2;                              // 高波动：紧止损
     }
 
     private TradeSignal holdSignal(String code, String name, String reason) {
