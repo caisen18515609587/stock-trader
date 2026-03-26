@@ -1142,26 +1142,70 @@ public class PlatformServer {
         }
         sb.append("</div></div>");
 
-        // ===== 每日明细表 =====
-        sb.append("<div class='card'><div class='card-header fw-bold'>📆 每日收益明细</div>");
-        sb.append("<div class='card-body p-0'>");
+        // ===== 每日明细表（含走势图） =====
+        // 先计算累计盈亏（升序）用于图表数据
+        List<String> sortedDays = new ArrayList<>(dailyPnl.keySet()); // 已升序
+        Map<String, Double> cumMap = new LinkedHashMap<>();
+        double runningCum = 0;
+        for (String day : sortedDays) {
+            runningCum += dailyPnl.getOrDefault(day, 0.0);
+            cumMap.put(day, runningCum);
+        }
+
+        sb.append("<div class='card'>");
+        sb.append("<div class='card-header fw-bold'>📆 每日收益明细</div>");
+        sb.append("<div class='card-body'>");
+
         if (dailyPnl.isEmpty()) {
-            sb.append("<p class='text-muted p-3 mb-0'>暂无交易数据</p>");
+            sb.append("<p class='text-muted mb-0'>暂无交易数据</p>");
         } else {
+            // ===== 走势图区域 =====
+            // 构建图表 JSON 数据（升序日期）
+            StringBuilder chartLabels = new StringBuilder("[");
+            StringBuilder chartDailyData = new StringBuilder("[");
+            StringBuilder chartCumData = new StringBuilder("[");
+            StringBuilder chartDailyColors = new StringBuilder("[");
+            boolean firstItem = true;
+            for (String day : sortedDays) {
+                if (!firstItem) {
+                    chartLabels.append(",");
+                    chartDailyData.append(",");
+                    chartCumData.append(",");
+                    chartDailyColors.append(",");
+                }
+                double dpnl = dailyPnl.getOrDefault(day, 0.0);
+                double cpnl = cumMap.getOrDefault(day, 0.0);
+                chartLabels.append("'").append(day).append("'");
+                chartDailyData.append(String.format("%.2f", dpnl));
+                chartCumData.append(String.format("%.2f", cpnl));
+                chartDailyColors.append(dpnl >= 0 ? "'rgba(40,167,69,0.75)'" : "'rgba(220,53,69,0.75)'");
+                firstItem = false;
+            }
+            chartLabels.append("]");
+            chartDailyData.append("]");
+            chartCumData.append("]");
+            chartDailyColors.append("]");
+
+            sb.append("<div class='mb-4'>");
+            sb.append("<div class='d-flex justify-content-between align-items-center mb-2'>");
+            sb.append("<span class='fw-bold text-secondary small'>📈 收益走势图</span>");
+            sb.append("<div class='btn-group btn-group-sm' role='group'>");
+            sb.append("<button type='button' class='btn btn-outline-primary active' id='btnShowBoth' onclick='showChart(\"both\")'>综合视图</button>");
+            sb.append("<button type='button' class='btn btn-outline-success' id='btnShowCum' onclick='showChart(\"cum\")'>累计盈亏</button>");
+            sb.append("<button type='button' class='btn btn-outline-danger' id='btnShowDaily' onclick='showChart(\"daily\")'>每日盈亏</button>");
+            sb.append("</div></div>");
+            sb.append("<div style='position:relative;height:280px;background:#fff;border:1px solid #dee2e6;border-radius:8px;padding:12px'>");
+            sb.append("<canvas id='profitChart'></canvas>");
+            sb.append("</div></div>");
+
+            // ===== 每日明细表格 =====
             sb.append("<div class='table-responsive'><table class='table table-sm table-hover mb-0'>");
             sb.append("<thead class='table-light'><tr>"
                     + "<th>日期</th><th>交易笔数</th><th>盈利笔</th><th>日胜率</th>"
                     + "<th>当日盈亏</th><th>盈亏率</th><th>累计盈亏</th></tr></thead><tbody>");
-            // 倒序
-            List<String> days = new ArrayList<>(dailyPnl.keySet());
+            // 倒序展示（最新在前）
+            List<String> days = new ArrayList<>(sortedDays);
             Collections.reverse(days);
-            // 先算各天累计（升序累加）
-            Map<String, Double> cumMap = new LinkedHashMap<>();
-            double running = 0;
-            for (String day : new ArrayList<>(dailyPnl.keySet())) {
-                running += dailyPnl.getOrDefault(day, 0.0);
-                cumMap.put(day, running);
-            }
             for (String day : days) {
                 double pnl = dailyPnl.getOrDefault(day, 0.0);
                 int cnt   = dailyCount.getOrDefault(day, 0);
@@ -1182,6 +1226,64 @@ public class PlatformServer {
                     cumClr, cum));
             }
             sb.append("</tbody></table></div>");
+
+            // ===== Chart.js 脚本 =====
+            sb.append("<script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js'></script>");
+            sb.append("<script>");
+            sb.append("(function(){");
+            sb.append("var labels=").append(chartLabels).append(";");
+            sb.append("var dailyData=").append(chartDailyData).append(";");
+            sb.append("var cumData=").append(chartCumData).append(";");
+            sb.append("var dailyColors=").append(chartDailyColors).append(";");
+            sb.append("var ctx=document.getElementById('profitChart').getContext('2d');");
+            sb.append("var chart=new Chart(ctx,{");
+            sb.append("  type:'bar',");
+            sb.append("  data:{");
+            sb.append("    labels:labels,");
+            sb.append("    datasets:[");
+            sb.append("      {type:'line',label:'累计盈亏(元)',data:cumData,");
+            sb.append("       borderColor:'#0d6efd',backgroundColor:'rgba(13,110,253,0.08)',");
+            sb.append("       borderWidth:2,pointRadius:3,pointHoverRadius:5,");
+            sb.append("       tension:0.3,fill:true,yAxisID:'yCum',order:1},");
+            sb.append("      {type:'bar',label:'当日盈亏(元)',data:dailyData,");
+            sb.append("       backgroundColor:dailyColors,");
+            sb.append("       borderRadius:3,yAxisID:'yDaily',order:2}");
+            sb.append("    ]");
+            sb.append("  },");
+            sb.append("  options:{");
+            sb.append("    responsive:true,maintainAspectRatio:false,");
+            sb.append("    interaction:{mode:'index',intersect:false},");
+            sb.append("    plugins:{");
+            sb.append("      legend:{position:'top',labels:{font:{size:12}}},");
+            sb.append("      tooltip:{callbacks:{label:function(ctx){");
+            sb.append("        return ctx.dataset.label+': '+(ctx.raw>=0?'+':'')+ctx.raw.toFixed(2)+'元';");
+            sb.append("      }}}");
+            sb.append("    },");
+            sb.append("    scales:{");
+            sb.append("      x:{ticks:{maxTicksLimit:15,font:{size:11}},grid:{display:false}},");
+            sb.append("      yCum:{type:'linear',position:'left',");
+            sb.append("            title:{display:true,text:'累计盈亏(元)',font:{size:11}},");
+            sb.append("            grid:{color:'rgba(0,0,0,0.05)'},");
+            sb.append("            ticks:{callback:function(v){return (v>=0?'+':'')+v.toFixed(0)+'元';},font:{size:11}}},");
+            sb.append("      yDaily:{type:'linear',position:'right',");
+            sb.append("              title:{display:true,text:'当日盈亏(元)',font:{size:11}},");
+            sb.append("              grid:{display:false},");
+            sb.append("              ticks:{callback:function(v){return (v>=0?'+':'')+v.toFixed(0)+'元';},font:{size:11}}}");
+            sb.append("    }");
+            sb.append("  }");
+            sb.append("});");
+            // 切换视图函数
+            sb.append("window.showChart=function(mode){");
+            sb.append("  var ds=chart.data.datasets;");
+            sb.append("  if(mode==='cum'){ds[0].hidden=false;ds[1].hidden=true;}");
+            sb.append("  else if(mode==='daily'){ds[0].hidden=true;ds[1].hidden=false;}");
+            sb.append("  else{ds[0].hidden=false;ds[1].hidden=false;}");
+            sb.append("  chart.update();");
+            sb.append("  document.querySelectorAll('#btnShowBoth,#btnShowCum,#btnShowDaily').forEach(function(b){b.classList.remove('active');});");
+            sb.append("  document.getElementById(mode==='cum'?'btnShowCum':mode==='daily'?'btnShowDaily':'btnShowBoth').classList.add('active');");
+            sb.append("};");
+            sb.append("})();");
+            sb.append("</script>");
         }
         sb.append("</div></div>");
         return sb.toString();
