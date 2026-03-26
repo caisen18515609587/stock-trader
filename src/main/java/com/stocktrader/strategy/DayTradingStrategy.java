@@ -290,11 +290,14 @@ public class DayTradingStrategy implements TradingStrategy {
                     boolean scoreWeak = currentScore < 55;
 
                     if (trendBearish) {
-                        // 趋势破位：尾盘清仓，无论盈亏
+                        // 趋势破位：尾盘清仓，无论盈亏；盈亏决定信号类型（影响报表统计准确性）
+                        TradeSignal.SignalType exitType = profitRate >= 0
+                                ? TradeSignal.SignalType.TAKE_PROFIT
+                                : TradeSignal.SignalType.STOP_LOSS;
                         return TradeSignal.builder()
                                 .signalId(UUID.randomUUID().toString())
                                 .stockCode(stockCode).stockName(stockName)
-                                .signalType(TradeSignal.SignalType.TAKE_PROFIT).strength(88)
+                                .signalType(exitType).strength(88)
                                 .suggestedPrice(currentPrice).strategyName(getStrategyName())
                                 .signalTime(LocalDateTime.now())
                                 .reason(String.format("[P1-1]尾盘清仓（技术面破位）：评分=%d 趋势=%s 当前盈亏=%.2f%%，清仓规避隔夜风险",

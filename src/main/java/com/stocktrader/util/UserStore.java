@@ -6,10 +6,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
+import java.sql.*;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -96,8 +93,6 @@ public class UserStore {
 
     /** INSERT OR REPLACE 到 t_user 表（含 wechat_open_id 字段） */
     private void upsertToDb(User user) {
-        // 确保数据库有 wechat_open_id 列（兼容旧数据库）
-        ensureWechatOpenIdColumn();
         String sql = "INSERT OR REPLACE INTO t_user(" +
                 "user_id, username, password_hash, nickname, email, initial_capital, " +
                 "strategy_type, strategy_config, wechat_open_id, wechat_send_key, status, is_super_admin, " +
@@ -131,16 +126,20 @@ public class UserStore {
         }
     }
 
-    /** 检测并添加 wechat_open_id 列（数据库升级兼容）*/
+    /** 检测并添加 wechat_open_id 列（数据库升级兼容），仅在初始化时调用一次 */
     private void ensureWechatOpenIdColumn() {
-        // 仅在初始化阶段调用，使用共享连接（此时无并发）
+        // 使用独立短连接，避免共享连接并发问题，Statement 放入 try-with-resources 防止泄漏
+        Connection conn = null;
         try {
-            db.getConnection().createStatement()
-                    .execute("ALTER TABLE t_user ADD COLUMN wechat_open_id TEXT DEFAULT ''");
-            log.info("[DB迁移] t_user 表已添加 wechat_open_id 列");
+            conn = db.newConnection();
+            try (Statement st = conn.createStatement()) {
+                st.execute("ALTER TABLE t_user ADD COLUMN wechat_open_id TEXT DEFAULT ''");
+                log.info("[DB迁移] t_user 表已添加 wechat_open_id 列");
+            }
         } catch (SQLException e) {
             // 列已存在时 SQLite 会抛出异常，这是正常的，忽略即可
-            // log.debug("wechat_open_id 列已存在，无需迁移");
+        } finally {
+            if (conn != null) { try { conn.close(); } catch (Exception ignore) {} }
         }
     }
 
@@ -151,22 +150,28 @@ public class UserStore {
         String sql = "SELECT user_id, username, password_hash, nickname, email, initial_capital, " +
                 "strategy_type, strategy_config, wechat_open_id, wechat_send_key, status, is_super_admin, " +
                 "create_time, last_login_time FROM t_user";
-        // 启动初始化阶段，单线程执行，使用共享连接即可
-        try (PreparedStatement ps = db.getConnection().prepareStatement(sql);
-             ResultSet rs = ps.executeQuery()) {
-            int count = 0;
-            while (rs.next()) {
-                User u = mapRow(rs);
-                if (u.getUserId() != null && !u.getUserId().isEmpty()) {
-                    userCache.put(u.getUserId(), u);
-                    usernameIndex.put(u.getUsername().toLowerCase(), u.getUserId());
-                    ensureUserDirs(u.getUserId());
-                    count++;
+        // 使用独立短连接，避免与业务代码共享连接导致并发冲突
+        Connection conn = null;
+        try {
+            conn = db.newConnection();
+            try (PreparedStatement ps = conn.prepareStatement(sql);
+                 ResultSet rs = ps.executeQuery()) {
+                int count = 0;
+                while (rs.next()) {
+                    User u = mapRow(rs);
+                    if (u.getUserId() != null && !u.getUserId().isEmpty()) {
+                        userCache.put(u.getUserId(), u);
+                        usernameIndex.put(u.getUsername().toLowerCase(), u.getUserId());
+                        ensureUserDirs(u.getUserId());
+                        count++;
+                    }
                 }
+                log.info("从数据库加载 {} 个用户", count);
             }
-            log.info("从数据库加载 {} 个用户", count);
         } catch (SQLException e) {
             log.error("从数据库加载用户失败", e);
+        } finally {
+            if (conn != null) { try { conn.close(); } catch (Exception ignore) {} }
         }
     }
 

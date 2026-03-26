@@ -31,7 +31,7 @@ public class DatabaseManager {
 
     private static final Logger log = LoggerFactory.getLogger(DatabaseManager.class);
 
-    private static DatabaseManager instance;
+    private static volatile DatabaseManager instance;
     private final String dbPath;
     /** 仅用于初始化阶段（建表/迁移），业务代码请使用 newConnection() */
     private Connection connection;
@@ -102,13 +102,14 @@ public class DatabaseManager {
         // 新唯一键：account_id + stock_code + sell_time + quantity + sell_price + avg_cost
         // 这6个字段完全相同才算真正的重复记录（旧版 save() 误用 now() 时产生的冗余数据）
         try (Statement st = connection.createStatement()) {
-            // 先统计有多少真正的重复行
-            java.sql.ResultSet rs = st.executeQuery(
+            // 先统计有多少真正的重复行（使用 try-with-resources 确保 ResultSet 不泄漏）
+            int dupCount = 0;
+            try (java.sql.ResultSet rs = st.executeQuery(
                 "SELECT COUNT(*) FROM t_closed_position WHERE id NOT IN (" +
                 "  SELECT MAX(id) FROM t_closed_position " +
-                "  GROUP BY account_id, stock_code, sell_time, quantity, sell_price, avg_cost)");
-            int dupCount = rs.next() ? rs.getInt(1) : 0;
-            rs.close();
+                "  GROUP BY account_id, stock_code, sell_time, quantity, sell_price, avg_cost)")) {
+                dupCount = rs.next() ? rs.getInt(1) : 0;
+            }
 
             if (dupCount > 0) {
                 log.warn("检测到 {} 条完全重复的平仓记录，将精准删除（保留每组最新一条）", dupCount);

@@ -50,6 +50,9 @@ public class StockScreener {
     private static final String PYTHON_SUSPEND_URL = "http://localhost:8099/suspend";
     // Python 个股新闻接口（含情感分析）
     private static final String PYTHON_STOCK_NEWS_URL = "http://localhost:8099/stock_news";
+    // [P1-1] 东方财富个股资金流向接口（免费公开）
+    // secid=市场代码.股票代码（1=沪市 0=深市），返回当日主力净流入数据
+    private static final String EMC_MONEY_FLOW_URL = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get";
 
     // 当日停牌股票集合（每日刷新，Set 便于 O(1) 查询）
     private Set<String> suspendedStocks = new HashSet<>();
@@ -256,11 +259,18 @@ public class StockScreener {
         List<Map<String, Object>> candidates = preFilter(allQuotes, maxAffordablePrice);
         log.info("预筛选后候选股票：{}只", candidates.size());
 
+        // [P1-1] Step2.5: 主力资金流入验证（剔除主力大幅流出股）
+        candidates = filterByMoneyFlow(candidates);
+        log.info("[P1-1] 资金流向过滤后候选股票：{}只", candidates.size());
+
         if (candidates.isEmpty()) {
-            log.warn("预筛选无候选股票，放宽条件重试...");
-            // 降级：仅保留资金过滤，去掉其他条件
-            candidates = preFilter(allQuotes, maxAffordablePrice);
-            if (candidates.isEmpty()) candidates = allQuotes;
+            log.warn("预筛选无候选股票，放宽条件降级重试...");
+            // 降级：调用无价格限制版本（仅ST/停牌过滤），再空则兜底取全量
+            candidates = preFilter(allQuotes, 0);
+            if (candidates.isEmpty()) {
+                log.warn("降级预筛选仍无结果，兜底取全量行情（{}只）", allQuotes.size());
+                candidates = allQuotes;
+            }
         }
 
         // Step3: 对候选股票并行获取K线并做技术分析
@@ -554,7 +564,7 @@ public class StockScreener {
         // MA60/ATR最多需要120根数据，120天已满足所有指标计算需求。
         LocalDate startDate = endDate.minusDays(180); // 多拶120天（含假日缓冲）
 
-        int[] counter = {0};
+        java.util.concurrent.atomic.AtomicInteger counter = new java.util.concurrent.atomic.AtomicInteger(0);
         int total = targetList.size();
 
         for (Map<String, Object> q : targetList) {
@@ -588,11 +598,10 @@ public class StockScreener {
                 } catch (Exception e) {
                     log.debug("分析股票{}失败: {}", code, e.getMessage());
                 } finally {
-                    synchronized (counter) {
-                        counter[0]++;
-                        if (counter[0] % 50 == 0) {
-                            log.info("  分析进度: {}/{}", counter[0], total);
-                        }
+                    // 使用 AtomicInteger 保证多线程下计数准确（原 int[] 有并发问题）
+                    int done = counter.incrementAndGet();
+                    if (done % 50 == 0) {
+                        log.info("  分析进度: {}/{}", done, total);
                     }
                 }
             });

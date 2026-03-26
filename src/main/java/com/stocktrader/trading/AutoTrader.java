@@ -232,6 +232,13 @@ public class AutoTrader {
     /** 大盘MA5下穿MA20（空头排列）时暂停新开仓标志 */
     private volatile boolean marketBearish = false;
     /**
+     * [P0-2] 大盘情绪综合评分（0~100）：
+     * 综合涨跌家数比、全市场成交量两个维度评估大盘情绪强弱。
+     * 分数越高表示市场情绪越积极，分数越低表示情绪越悲观。
+     * 门槛：评分 < 35 时，自动将买入信号的阈值从85提高到90（更严格的过滤）。
+     */
+    private volatile int marketSentimentScore = 50; // 默认中性
+    /**
      * [P0-2 优化] 深度熊市标志：MA5 < MA20 < MA60（三线空头排列）
      * <p>
      * 区别于普通弱势（marketBearish，MA5<MA20）：
@@ -850,12 +857,43 @@ public class AutoTrader {
         boolean isOpeningProtectWindow = isNextDayAfterBuy
                 && now.isAfter(LocalTime.of(9, 29))  // 9:30开盘起
                 && now.isBefore(LocalTime.of(9, 36)); // 9:36前（含9:35这一分钟）
+
+        // ===== [P3-1 优化] 极端跳空低开立即止损（穿越保护窗口）=====
+        // 背景：正常开盘保护窗口设计用于过滤「小幅低开随后回升」的场景；
+        //   但当次日开盘价相较成本下跌 >= 5%（极端跳空），说明出现重大利空（一字跌停/重大事件），
+        //   继续等待只会越套越深，必须立即止损出局，不能等到9:35保护期结束。
+        // 规则：次日开盘保护期内（9:30~9:35），若开盘价 <= 成本 × (1 - EXTREME_GAP_DOWN_PCT)，
+        //   立即触发极端跳空止损，穿越保护窗口限制。
+        // 默认阈值：成本-5%（可通过常量配置）
+        final double EXTREME_GAP_DOWN_PCT = 0.05; // 5%跳空立即止损
+        if (isOpeningProtectWindow && profitRate <= -EXTREME_GAP_DOWN_PCT) {
+            log.warn("[P3-1极端跳空止损] {} {} 次日开盘跳空低开={}%（<=-{}%），穿越保护窗口立即止损！成本={} 现价={}",
+                    code, stockName,
+                    String.format("%.2f", profitRate * 100),
+                    String.format("%.0f", EXTREME_GAP_DOWN_PCT * 100),
+                    String.format("%.2f", avgCost),
+                    String.format("%.2f", currentPrice));
+            TradeSignal gapStopSignal = TradeSignal.builder()
+                    .signalId(java.util.UUID.randomUUID().toString())
+                    .stockCode(code).stockName(stockName)
+                    .signalType(TradeSignal.SignalType.STOP_LOSS)
+                    .strength(100)
+                    .suggestedPrice(currentPrice)
+                    .strategyName("极端跳空止损")
+                    .signalTime(LocalDateTime.now())
+                    .reason(String.format("[P3-1极端跳空止损] 次日开盘跳空低开%.2f%%（超-5%%阈值），立即止损。成本=%.2f 现价=%.2f",
+                            profitRate * 100, avgCost, currentPrice))
+                    .build();
+            executeSell(gapStopSignal);
+            return;
+        }
+
         if (isOpeningProtectWindow) {
             log.debug("[开盘保护] {} {} 次日开盘5分钟保护期（9:30-9:35），暂停止损判断（当前亏损={}%，成本={}，现价={}）",
                     code, stockName, String.format("%.2f", profitRate * 100),
                     String.format("%.2f", avgCost), String.format("%.2f", currentPrice));
             // 仅跳过止损，追踪止盈等其他检查继续执行
-            // 注意：极端情况（跌>5%）也跳过——极端开盘若真的破位，9:35后的止损也会触发
+            // 注意：小幅低开（<5%）跳过——9:35后的止损也会触发
         } else {
 
         // 次日开盘紧止损（2%）：9:35后才执行，避免开盘瞬间假突破止损
@@ -1240,12 +1278,14 @@ public class AutoTrader {
             boolean ma5BelowMa20 = false;
             // [P0-2] 提升到 try 块外，供后续 marketDeepBearish 赋值使用
             boolean sh000001DeepBearish = false; // MA5<MA20<MA60 三线空头
+            // [P0-2] indexBars 声明提升到 try 块外，供 updateMarketSentimentScore() 复用
+            List<StockBar> indexBars = null;
             try {
                 LocalDate endDate = LocalDate.now();
                 LocalDate startDate = endDate.minusMonths(3);
                 // 上证指数 MA 判断（含 MA60 深度熊市检测）
                 boolean sh000001Bearish = false;
-                List<StockBar> indexBars = dataProvider.getDailyBars(
+                indexBars = dataProvider.getDailyBars(
                         MARKET_INDEX_CODE, startDate, endDate, StockBar.AdjustType.NONE);
                 if (indexBars != null && indexBars.size() >= 20) {
                     List<Double> closes = new ArrayList<>();
@@ -1300,18 +1340,127 @@ public class AutoTrader {
             marketDeepBearish = ma5BelowMa20 && sh000001DeepBearish;
             marketStatusLastUpdate = now;
 
+            // [P0-2] 更新大盘情绪综合评分（涨跌家数比 + 指数量能）
+            updateMarketSentimentScore(indexBars);
+
             if (marketDeepBearish) {
-                log.warn("[大盘择时-深度熊市] MA5<MA20<MA60 三线空头排列！当日涨跌幅={}%，暂停新开仓+禁止换仓",
-                        String.format("%.2f", changePct));
+                log.warn("[大盘择时-深度熊市] MA5<MA20<MA60 三线空头排列！当日涨跌幅={}%，暂停新开仓+禁止换仓（情绪分={}）",
+                        String.format("%.2f", changePct), marketSentimentScore);
             } else if (marketBearish) {
-                log.info("[大盘择时] 大盘风险预警：当日涨跌幅={} %，双指数MA5{}MA20，暂停新开仓",
-                        String.format("%.2f", changePct), ma5BelowMa20 ? "<" : ">=");
+                log.info("[大盘择时] 大盘风险预警：当日涨跌幅={} %，双指数MA5{}MA20，暂停新开仓（情绪分={}）",
+                        String.format("%.2f", changePct), ma5BelowMa20 ? "<" : ">=", marketSentimentScore);
+            } else {
+                log.debug("[大盘情绪] 当日涨跌幅={}%，情绪综合评分={}", String.format("%.2f", changePct), marketSentimentScore);
             }
         } catch (Exception e) {
             log.debug("[大盘择时] 获取大盘行情异常，跳过择时过滤: {}", e.getMessage());
             marketStatusLastUpdate = now;
         }
         return marketBearish;
+    }
+
+    /**
+     * [P0-2] 更新大盘情绪综合评分（0~100）
+     * <p>
+     * 评分维度：
+     * 1. 涨跌家数比（权重60%）：
+     *    通过东方财富行情接口统计全市场涨跌家数，
+     *    涨跌比 = 上涨家数 / (上涨家数 + 下跌家数)，映射到 0~100 分。
+     *    - 涨跌比 >= 0.65：市场普涨，得满分100
+     *    - 涨跌比 = 0.50：五五开，得50分
+     *    - 涨跌比 <= 0.30：普跌，得0分
+     * 2. 指数量能（权重40%）：
+     *    当日成交量相对5日均量的比值，衡量市场活跃度。
+     *    - 量比 >= 1.5：放量，得100分
+     *    - 量比 = 1.0：平量，得50分
+     *    - 量比 <= 0.5：缩量，得0分
+     * <p>
+     * 综合评分 = 涨跌比得分 * 0.60 + 量能比得分 * 0.40
+     * 评分 < 35：情绪悲观，动态提高买入信号阈值（85→90），更严格过滤
+     * </p>
+     *
+     * @param indexBars 上证指数近期日K线（已在 isMarketBearishNow() 中获取，避免重复请求）
+     */
+    private void updateMarketSentimentScore(List<StockBar> indexBars) {
+        try {
+            // ===== 维度1：涨跌家数比（权重60%）=====
+            // 通过东方财富全市场行情接口获取涨跌统计
+            int upCount = 0, downCount = 0;
+            try {
+                // 东方财富全量行情列表（只拉 f3=涨跌幅 字段，快速统计涨跌家数）
+                String breadthUrl = "https://push2.eastmoney.com/api/qt/clist/get?" +
+                        "pn=1&pz=5000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2" +
+                        "&fid=f3&fs=m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23" +
+                        "&fields=f3&_=" + System.currentTimeMillis();
+                // 通过反射调用 dataProvider 内部的 httpGet（TongHuaShunDataProvider）
+                // 由于接口未暴露 httpGet，此处使用 OkHttp 独立调用
+                okhttp3.OkHttpClient breadthClient = new okhttp3.OkHttpClient.Builder()
+                        .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+                        .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                        .build();
+                okhttp3.Request req = new okhttp3.Request.Builder().url(breadthUrl).build();
+                try (okhttp3.Response resp = breadthClient.newCall(req).execute()) {
+                    if (resp.isSuccessful() && resp.body() != null) {
+                        String body = resp.body().string();
+                        com.fasterxml.jackson.databind.ObjectMapper mapper =
+                                new com.fasterxml.jackson.databind.ObjectMapper();
+                        com.fasterxml.jackson.databind.JsonNode root = mapper.readTree(body);
+                        com.fasterxml.jackson.databind.JsonNode items = root.path("data").path("diff");
+                        if (items.isArray()) {
+                            for (com.fasterxml.jackson.databind.JsonNode item : items) {
+                                double chgPct = item.path("f3").asDouble(0);
+                                if (chgPct > 0) upCount++;
+                                else if (chgPct < 0) downCount++;
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("[P0-2情绪] 获取涨跌家数失败: {}", e.getMessage());
+            }
+
+            // 涨跌比评分（0~100）
+            int breadthScore = 50; // 默认中性
+            int total = upCount + downCount;
+            if (total >= 100) { // 至少100只股票才有统计意义
+                double upRatio = (double) upCount / total;
+                // 线性映射：[0.30, 0.65] → [0, 100]
+                breadthScore = (int) Math.round(Math.min(100, Math.max(0,
+                        (upRatio - 0.30) / (0.65 - 0.30) * 100)));
+            }
+
+            // ===== 维度2：指数量能（权重40%）=====
+            // 用已有的 indexBars（上证指数日K线），计算当日量比（当日量/5日均量）
+            int volumeScore = 50; // 默认平量
+            if (indexBars != null && indexBars.size() >= 6) {
+                int sz = indexBars.size();
+                long todayVol = indexBars.get(sz - 1).getVolume();
+                // 计算前5日平均量（不含今日）
+                long sum5 = 0;
+                for (int i = sz - 6; i < sz - 1; i++) {
+                    sum5 += indexBars.get(i).getVolume();
+                }
+                double avg5Vol = sum5 / 5.0;
+                if (avg5Vol > 0) {
+                    double volRatio = todayVol / avg5Vol;
+                    // 线性映射：[0.5, 1.5] → [0, 100]
+                    volumeScore = (int) Math.round(Math.min(100, Math.max(0,
+                            (volRatio - 0.5) / (1.5 - 0.5) * 100)));
+                }
+            }
+
+            // ===== 综合评分（涨跌比 60% + 量能 40%）=====
+            int newScore = (int) Math.round(breadthScore * 0.60 + volumeScore * 0.40);
+            int oldScore = marketSentimentScore;
+            // 平滑处理：新值与旧值各取一半，避免单次数据抖动引发评分剧烈变化
+            marketSentimentScore = (int) Math.round(newScore * 0.7 + oldScore * 0.3);
+
+            log.info("[P0-2情绪评分] 上涨={}家 下跌={}家 涨跌比分={} 量能分={} → 综合情绪分={}（上次={}）",
+                    upCount, downCount, breadthScore, volumeScore, marketSentimentScore, oldScore);
+
+        } catch (Exception e) {
+            log.debug("[P0-2情绪] 更新情绪评分异常，保留上次评分({}): {}", marketSentimentScore, e.getMessage());
+        }
     }
 
     /**
@@ -1705,6 +1854,26 @@ public class AutoTrader {
             }
         }
 
+        // ===== [P0-2] 大盘情绪评分过滤：情绪悲观时动态提高买入信号阈值 =====
+        // 逻辑：当 marketSentimentScore < 35（悲观市场，多数股票下跌+成交量萎缩），
+        //   将大盘 MA5<MA20 弱势市的信号强度阈值从85提高到90，执行更严格的过滤。
+        // 目的：在大盘 MA5<MA20 且情绪极度悲观时，只允许极强信号（≥90分）通过，
+        //   进一步降低在弱势市场中买入的频率，减少在普跌行情中的无谓损耗。
+        // 豁免：若大盘 MA5>=MA20（正常或强势市），情绪评分不额外限制买入。
+        if (!isAddPositionSignal && marketBearish && !marketDeepBearish && marketSentimentScore < 35) {
+            int signalStrength = signal.getStrength();
+            // 情绪悲观时阈值提高到 90
+            final int SENTIMENT_PESSIMISTIC_THRESHOLD = 90;
+            if (signalStrength < SENTIMENT_PESSIMISTIC_THRESHOLD) {
+                log.info("[P0-2情绪过滤] {} 大盘情绪评分={}（<35悲观），弱势市信号阈值提高至{}分，" +
+                        "当前信号强度{}分不足，拒绝买入", code, marketSentimentScore,
+                        SENTIMENT_PESSIMISTIC_THRESHOLD, signalStrength);
+                return;
+            }
+            log.info("[P0-2情绪过滤] {} 情绪评分={}悲观，但信号强度={}分（>={}），允许建仓",
+                    code, marketSentimentScore, signalStrength, SENTIMENT_PESSIMISTIC_THRESHOLD);
+        }
+
         // ===== 当日涨幅过滤：差异化阈值（主板5%，科创板/创业板10%） =====
         // [P2-1 优化] A股涨跌停幅度差异化：
         //   - 科创板（688xxx）、创业板（300xxx）：涨跌停限制为±20%，追涨红线放宽至10%
@@ -1812,30 +1981,85 @@ public class AutoTrader {
             }
         }
 
-        // ===== 分钟线辅助确认（仅短线策略）：买入前用5分钟线确认日内趋势向上 =====
-        // 策略：取最近10根5分钟K线，要求最新一根收盘价>开盘价（阳线）且近3根MA5向上。
+        // ===== [P0-1 优化] 分钟线多维买入确认（仅短线策略）=====
+        // 增强逻辑：在原有"最新阴线+3根连续下行"基础上新增：
+        //   ① 5分钟线成交量萎缩过滤：近3根5分钟量持续缩量（每根量<前根×80%），无量下跌不买
+        //   ② 5分钟线MACD方向确认：5分钟DIF < DEA（分钟级MACD偏空），不与日线反向操作
+        //   ③ 极端跳水过滤：最新3根5分钟收盘价累计跌幅 > -1.5%，说明日内出现快速杀跌
+        // 触发规则：以上3条满足任意2条，即视为日内趋势偏弱，拒绝买入
         // 目的：过滤"日线多头但盘中正在向下运行"的虚假信号，降低日内抄底风险。
         // 豁免：仅对 DayTradingStrategy 生效；中长线/其他策略不受分钟线干扰。
         if (!isAddPositionSignal && strategy instanceof DayTradingStrategy) {
             try {
-                List<StockBar> min5Bars = dataProvider.getMinuteBars(code, StockBar.BarPeriod.MIN_5, 12);
+                List<StockBar> min5Bars = dataProvider.getMinuteBars(code, StockBar.BarPeriod.MIN_5, 15);
                 if (min5Bars != null && min5Bars.size() >= 6) {
-                    // 最新一根5分钟K线是阴线（收<开），日内正在走弱
-                    StockBar latestMin5 = min5Bars.get(min5Bars.size() - 1);
-                    boolean latestIsDown = latestMin5.getClose() < latestMin5.getOpen();
-                    // 最近3根收盘价是否连续下行（趋势向下）
                     int sz = min5Bars.size();
+                    StockBar latestMin5 = min5Bars.get(sz - 1);
+
+                    // ① 原有逻辑：最新阴线 + 近3根连续下行
+                    boolean latestIsDown = latestMin5.getClose() < latestMin5.getOpen();
                     boolean continuousDown = sz >= 3
                             && min5Bars.get(sz - 1).getClose() < min5Bars.get(sz - 2).getClose()
                             && min5Bars.get(sz - 2).getClose() < min5Bars.get(sz - 3).getClose();
-                    if (latestIsDown && continuousDown) {
-                        log.info("[分钟线过滤] {} 5分钟线最新阴线且近3根连续下行，日内趋势偏弱，拒绝短线买入（防日内追高买在弱势）",
-                                code);
+                    boolean basicWeakSignal = latestIsDown && continuousDown;
+
+                    // ② [P0-1新增] 5分钟成交量萎缩：近3根量逐根递减（有序缩量，空头走弱特征）
+                    boolean volumeShrinking = false;
+                    if (sz >= 4) {
+                        long v1 = min5Bars.get(sz - 3).getVolume(); // 3根前
+                        long v2 = min5Bars.get(sz - 2).getVolume(); // 2根前
+                        long v3 = min5Bars.get(sz - 1).getVolume(); // 最新
+                        // 连续3根量递减，且最新量 < 3根前量的50%（严重缩量+下行=主动卖出衰竭前兆）
+                        volumeShrinking = (v1 > 0) && (v2 < v1 * 0.8) && (v3 < v2 * 0.8) && (v3 < v1 * 0.5);
+                    }
+
+                    // ③ [P0-1新增] 5分钟MACD空头确认：计算最近12根5分钟的简易DIF判断
+                    boolean min5MacdBearish = false;
+                    if (sz >= 12) {
+                        // 用最近12根收盘价计算简化EMA(6) 和 EMA(12)，判断DIF方向
+                        double ema6 = 0, ema12 = 0;
+                        double k6 = 2.0 / 7.0, k12 = 2.0 / 13.0;
+                        // 用前6根初始化EMA6，前12根初始化EMA12
+                        double sum6 = 0, sum12 = 0;
+                        for (int i = sz - 12; i < sz - 6; i++) sum12 += min5Bars.get(i).getClose();
+                        for (int i = sz - 6; i < sz; i++) { sum6 += min5Bars.get(i).getClose(); sum12 += min5Bars.get(i).getClose(); }
+                        ema6 = sum6 / 6.0; ema12 = sum12 / 12.0;
+                        // 再用最新一根做一步EMA更新
+                        double close0 = min5Bars.get(sz - 1).getClose();
+                        ema6  = close0 * k6  + ema6  * (1 - k6);
+                        ema12 = close0 * k12 + ema12 * (1 - k12);
+                        double dif = ema6 - ema12;
+                        // 同时要求DIF < 0（空头区域）且近2根DIF方向向下（当前DIF < 前一根）
+                        double close1 = min5Bars.get(sz - 2).getClose();
+                        double ema6Prev  = sum6 / 6.0 * (1 - k6)  + close1 * k6;
+                        double ema12Prev = sum12 / 12.0 * (1 - k12) + close1 * k12;
+                        double difPrev = ema6Prev - ema12Prev;
+                        min5MacdBearish = (dif < 0) && (dif < difPrev); // DIF在0轴下方且继续下行
+                    }
+
+                    // ④ [P0-1新增] 日内快速杀跌：最近3根5分钟累计跌幅 > -1.5%
+                    boolean rapidDrop = false;
+                    if (sz >= 3) {
+                        double priceRef = min5Bars.get(sz - 3).getOpen(); // 3根前开盘价作为参考
+                        if (priceRef > 0) {
+                            double dropPct = (latestMin5.getClose() - priceRef) / priceRef;
+                            rapidDrop = dropPct < -0.015; // 3根内跌超1.5%
+                        }
+                    }
+
+                    // 触发规则：基础弱信号 OR (4条中满足任意2条)
+                    int weakCount = (basicWeakSignal ? 1 : 0) + (volumeShrinking ? 1 : 0)
+                            + (min5MacdBearish ? 1 : 0) + (rapidDrop ? 1 : 0);
+                    if (basicWeakSignal || weakCount >= 2) {
+                        log.info("[P0-1分钟线过滤] {} 日内趋势偏弱（{}条弱信号），拒绝短线买入" +
+                                " | 基础弱={} 缩量={} 5mMACD空={} 快速杀跌={}",
+                                code, weakCount, basicWeakSignal, volumeShrinking, min5MacdBearish, rapidDrop);
                         return;
                     }
+                    log.debug("[P0-1分钟线过滤] {} 5分钟线验证通过（{}条弱信号<2），允许买入", code, weakCount);
                 }
             } catch (Exception e) {
-                log.debug("[分钟线过滤] {} 获取5分钟K线失败，跳过分钟线方向确认: {}", code, e.getMessage());
+                log.debug("[P0-1分钟线过滤] {} 获取5分钟K线失败，跳过分钟线方向确认: {}", code, e.getMessage());
             }
         }
 

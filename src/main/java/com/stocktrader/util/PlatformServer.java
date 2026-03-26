@@ -109,9 +109,12 @@ public class PlatformServer {
 
     public void stop() {
         running.set(false);
-        userTraders.values().forEach(t -> {
-            try { /* AutoTrader无stop方法，通过interrupt停止 */ } catch (Exception ignored) {}
-        });
+        // 优雅停止所有 AuctionTrader（原代码遗漏！）
+        auctionTraders.values().forEach(t -> { try { t.stopTrading(); } catch (Exception ignored) {} });
+        auctionTraders.clear();
+        // 优雅停止所有 AutoTrader
+        userTraders.values().forEach(t -> { try { t.stopTrading(); } catch (Exception ignored) {} });
+        userTraders.clear();
         executor.shutdownNow();
     }
 
@@ -149,10 +152,18 @@ public class PlatformServer {
                 int contentLength = 0;
                 try { contentLength = Integer.parseInt(headers.getOrDefault("content-length", "0")); }
                 catch (Exception ignored) {}
+                // 防止 Content-Length 过大导致 OOM（1MB 上限）
+                if (contentLength > 1024 * 1024) { contentLength = 1024 * 1024; }
                 if (contentLength > 0) {
                     char[] body = new char[contentLength];
-                    reader.read(body, 0, contentLength);
-                    postParams = parseQuery(new String(body));
+                    // 循环读取确保读满（单次 read 可能不返回全部内容）
+                    int totalRead = 0;
+                    while (totalRead < contentLength) {
+                        int n = reader.read(body, totalRead, contentLength - totalRead);
+                        if (n < 0) break;
+                        totalRead += n;
+                    }
+                    postParams = parseQuery(new String(body, 0, totalRead));
                 }
             }
 
@@ -631,7 +642,7 @@ public class PlatformServer {
         sb.append("<div class='card-body'>");
         sb.append(String.format("<span class='badge bg-primary fs-6'>%s</span> &nbsp;",
                 user.getStrategyType().getDesc()));
-        if (sc != null) sb.append("<small class='text-muted'>" + sc.getSummary() + "</small>");
+        if (sc != null) sb.append("<small class='text-muted'>" + htmlEscape(sc.getSummary()) + "</small>");
         // 扫描间隔调节区域
         sb.append("<hr class='my-2'>");
         sb.append("<div class='d-flex align-items-center gap-2 flex-wrap'>");
@@ -1167,6 +1178,8 @@ public class PlatformServer {
             StringBuilder chartDailyColors = new StringBuilder("[");
             boolean firstItem = true;
             for (String day : sortedDays) {
+                // 白名单校验：日期必须是 yyyy-MM-dd 格式，防止 XSS 注入
+                if (!day.matches("\\d{4}-\\d{2}-\\d{2}")) continue;
                 if (!firstItem) {
                     chartLabels.append(",");
                     chartDailyData.append(",");
@@ -1349,9 +1362,7 @@ public class PlatformServer {
      * 撤销记录页：展示所有因实盘操作失败而触发的模拟账户回滚记录，可用于后续分析。
      */
     private String pageRollbackRecords(User user) {
-        String accountId = userService.getStore().getUserAccountDir(user.getUserId())
-                .replace("./data/users/", "").replace("/", "") + "_auto_main";
-        // 兼容账户ID格式
+        // 直接使用 userId 构建账户ID，删除无用的路径操作死代码
         String userId = user.getUserId();
         String acctId = userId + "_auto_main";
 
@@ -1536,7 +1547,9 @@ public class PlatformServer {
             if (eq > 0) {
                 String k = pair.substring(0, eq);
                 String v = pair.substring(eq + 1);
-                try { v = URLDecoder.decode(v, "UTF-8"); } catch (Exception ignored) {}
+                // 使用 StandardCharsets 替代废弃的 String 参数方式，同时对键名也做解码
+                try { k = URLDecoder.decode(k, StandardCharsets.UTF_8.name()); } catch (Exception ignored) {}
+                try { v = URLDecoder.decode(v, StandardCharsets.UTF_8.name()); } catch (Exception ignored) {}
                 map.put(k, v);
             }
         }

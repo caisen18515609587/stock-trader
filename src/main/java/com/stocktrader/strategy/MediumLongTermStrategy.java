@@ -280,7 +280,25 @@ public class MediumLongTermStrategy implements TradingStrategy {
                         ChronoUnit.DAYS.between(pos.getLastUpdateTime().toLocalDate(),
                                 java.time.LocalDate.now()) >= 5;
 
-                if (isProfitable && bullishMA && macdStrong && holdLongEnough && cooldownOk) {
+                // [P2-2] 加仓条件6：当前价不高于20日均线的1.05倍（避免高位追涨加仓）
+                // 原理：当股价已显著高于MA20（乖离率过大）时，短期回调风险增加
+                //       此时应等待股价回归均线附近再加仓，而非高位追涨
+                boolean priceNearMA20 = analysis == null || // 无分析数据时跳过此检查
+                        currentPrice <= analysis.getMa20() * 1.05;
+
+                // [P2-2] 日志输出：记录被过滤的加仓信号原因
+                if (isProfitable && bullishMA && macdStrong && holdLongEnough && cooldownOk && !priceNearMA20) {
+                    double deviationPct = analysis != null
+                            ? (currentPrice / analysis.getMa20() - 1) * 100
+                            : 0;
+                    log.info("[P2-2] {} {} 加仓被过滤：当前价={:.2f} 高于MA20={:.2f}的{:.1f}%，乖离率过大",
+                            stockCode, stockName, currentPrice, analysis.getMa20(), deviationPct);
+                }
+
+                if (isProfitable && bullishMA && macdStrong && holdLongEnough && cooldownOk && priceNearMA20) {
+                    double ma20Dist = analysis != null
+                            ? (currentPrice / analysis.getMa20() - 1) * 100
+                            : 0;
                     return TradeSignal.builder()
                             .signalId(UUID.randomUUID().toString())
                             .stockCode(stockCode).stockName(stockName)
@@ -289,8 +307,8 @@ public class MediumLongTermStrategy implements TradingStrategy {
                             .suggestedPrice(currentPrice)
                             .strategyName(getStrategyName())
                             .signalTime(LocalDateTime.now())
-                            .reason(String.format("[加仓] 浮盈=%.1f%% 均线多头+MACD强势，金字塔补仓30%%仓位",
-                                    profitRateNow * 100))
+                            .reason(String.format("[加仓] 浮盈=%.1f%% 均线多头+MACD强势 MA20乖离=%.1f%%，金字塔补仓30%%仓位",
+                                    profitRateNow * 100, ma20Dist))
                             .build();
                 }
             }

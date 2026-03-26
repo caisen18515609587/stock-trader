@@ -839,7 +839,7 @@ def get_auction_realtime():
                 if not short_code:
                     continue
 
-                # 新浪字段含义（A股，普通交易时段）:
+                    # 新浪字段含义（A股，普通交易时段）:
                 # 0=名称,1=今开,2=昨收,3=现价,4=今高,5=今低,
                 # 6=买一价,7=买一量,8=卖一价,9=卖一量,
                 # 10~19=买二~买五价/量, 20~29=卖二~卖五价/量
@@ -854,6 +854,9 @@ def get_auction_realtime():
                     high      = safe_float(parts_d[4])
                     low       = safe_float(parts_d[5])
                     buy1_price = safe_float(parts_d[6])   # 买一价（竞价阶段的撮合价）
+                    buy1_vol  = safe_float(parts_d[7])   # [P1-3] 买一量（手）
+                    sell1_price = safe_float(parts_d[8]) # 卖一价
+                    sell1_vol  = safe_float(parts_d[9])  # [P1-3] 卖一量（手）
                     volume    = safe_float(parts_d[30]) if len(parts_d) > 30 else safe_float(parts_d[8])  # 手
                     amount    = safe_float(parts_d[31]) if len(parts_d) > 31 else safe_float(parts_d[9])  # 元
 
@@ -873,6 +876,8 @@ def get_auction_realtime():
 
                     # 昨日成交量：新浪实时接口不直接提供，但 parts[36] 在部分版本包含
                     # 保守起见置0，Java 端会用 volumeRatio 字段判断
+                    # [P1-3] 计算集合竞价买卖盘强度（买一量/卖一量），用于判断竞价时的多空力量
+                    bid_ask_ratio = (buy1_vol / sell1_vol) if sell1_vol > 0 else 0.0
                     result.append({
                         'code':          short_code,
                         'name':          name,
@@ -886,6 +891,10 @@ def get_auction_realtime():
                         'volume':        volume * 100,  # 手 → 股
                         'amount':        amount,
                         'isRealtime':    True,
+                        # [P1-3] 集合竞价买卖盘数据
+                        'bid1Vol':       buy1_vol,        # 买一量（手）
+                        'ask1Vol':       sell1_vol,       # 卖一量（手）
+                        'bidAskRatio':   round(bid_ask_ratio, 4),  # 买卖量比
                     })
                 except Exception:
                     continue

@@ -214,6 +214,9 @@ public class SimulationEngine {
             quantity = (quantity / 100) * 100;
         }
 
+        // 提前保存成本价（executeSell 后持仓可能被清除，avgCost 会变为 0）
+        double avgCost = position.getAvgCost();
+
         double actualAmount = quantity * price;
         String exchange = detectExchange(signal.getStockCode());
         FeeCalculator.FeeDetail fee = feeCalculator.calculateSellFee(actualAmount, exchange);
@@ -241,7 +244,7 @@ public class SimulationEngine {
 
         boolean success = portfolio.executeSell(order);
         if (success) {
-            double profitLoss = (price - position.getAvgCost()) * quantity - fee.total;
+            double profitLoss = (price - avgCost) * quantity - fee.total;
             log.info("模拟卖出成功：{} {}股 @{}，盈亏{}，费用{}",
                     signal.getStockCode(), quantity,
                     String.format("%.2f", price),

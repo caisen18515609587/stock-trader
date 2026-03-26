@@ -156,11 +156,9 @@ public class IntradayTradingStrategy implements TradingStrategy {
         if (now.isBefore(MARKET_OPEN) || now.isAfter(MARKET_CLOSE)) {
             return hold(stockCode, stockName, "非交易时段");
         }
-        if (now.isAfter(MORNING_END) && now.isBefore(AFTERNOON_START)) {
-            return hold(stockCode, stockName, "午休时段");
-        }
 
         // ===== 已持仓：止损/止盈/高点做T减仓 =====
+        // 午休判断移到这里之后：止损逻辑全天有效（包括午休期间），仅阅止新建仓
         if (hasPosition) {
             Position pos = portfolio.getPosition(stockCode);
             double avgCost = pos.getAvgCost();
@@ -243,6 +241,10 @@ public class IntradayTradingStrategy implements TradingStrategy {
         // 尾盘不新建仓（14:45后）
         if (now.isAfter(NO_NEW_BUY_AFTER)) {
             return hold(stockCode, stockName, "尾盘不新建仓");
+        }
+        // 午休时段不新建仓（11:30-13:00）——止损逻辑已在上方执行，仅限制新建仓
+        if (now.isAfter(MORNING_END) && now.isBefore(AFTERNOON_START)) {
+            return hold(stockCode, stockName, "午休时段，不新建仓");
         }
         // 开盘后3分钟内（9:30-9:33）不追涨开盘跳空，等待行情稳定
         if (now.isBefore(LocalTime.of(9, 33))) {
@@ -380,7 +382,7 @@ public class IntradayTradingStrategy implements TradingStrategy {
      * 用于检测低点企稳信号（可买入）
      */
     private boolean isPriceUpTrend() {
-        if (recentPrices.size() < 3) return true; // 数据不足时保守地允许买入
+        if (recentPrices.size() < 3) return false; // 数据不足时保守不买（避免无趋势确认时误买）
         Double[] arr = recentPrices.toArray(new Double[0]);
         int n = arr.length;
         // 最近3个价格点中，至少2个连续上行

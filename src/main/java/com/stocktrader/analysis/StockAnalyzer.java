@@ -18,18 +18,23 @@ import java.util.Map;
  * 【权重依据】经过历史 IC 检验（FactorIcTester#batchTechTest），
  * 各技术因子对未来 5 日收益率的预测能力排序（A 股全市场月度截面，2023-2025）：
  * <pre>
- *  因子         |IC均值|  ICIR  有效性
- *  MA_SCORE      较强     ↑      ★★★  → 权重 0.28
- *  MOMENTUM_20   较强     ↑      ★★★  → 权重 0.20（中期动量）
- *  MACD_DIF      中等     ↑      ★★   → 权重 0.20
- *  MOMENTUM_5    中等     ↑      ★★   → 权重 0.12（短期动量，反向弱）
- *  RSI6          弱       ↓      ★    → 权重 0.10（超卖反弹弱信号）
- *  KDJ_J         弱       ↓      ★    → 权重 0.06（方向反向，超买超卖信息）
- *  BOLL_POS      弱/无效  ↓      ✗    → 权重 0.04（保留极小权重）
- *  VOL_RATIO     无效              ✗   → 权重 0（移除）
- *  BOLL_WIDTH    无效              ✗   → 权重 0（移除）
+ *  因子           |IC均值|  ICIR  有效性
+ *  MA_SCORE        较强     ↑      ★★★  → 权重 0.25（调降：为新因子腾出权重）
+ *  MOMENTUM_20     较强     ↑      ★★★  → 权重 0.18（中期动量）
+ *  MACD_DIF        中等     ↑      ★★   → 权重 0.18
+ *  MOMENTUM_5      中等     ↑      ★★   → 权重 0.11（短期动量，反向弱）
+ *  OBV_SLOPE       中等     ↑      ★★   → 权重 0.10（[P3-2新增] OBV斜率：资金持续流入）
+ *  RSI6            弱       ↓      ★    → 权重 0.09（超卖反弹弱信号）
+ *  WEEK52_POSITION 中等     ↑      ★★   → 权重 0.05（[P1-2新增] 52周位置：低位吸筹加分）
+ *  KDJ_J           弱       ↓      ★    → 权重 0.05（方向反向，降权）
+ *  BOLL_POS        弱/无效  ↓      ✗    → 权重 0（降至0，IC无效移除）
+ *  VOL_RATIO       无效              ✗   → 权重 0（移除）
+ *  BOLL_WIDTH      无效              ✗   → 权重 0（移除）
  * </pre>
  * 注：IC 方向为负（因子值↑→未来收益↓）的指标采用取反处理（等效于超卖为正信号）。
+ * [P1-2] 52周新高位置因子：当前价 / 52周最高价，低位（<0.7）加分（距新高空间大），
+ *          高位（>0.95）减分（追高风险）。
+ * [P3-2] OBV斜率因子：计算近20日OBV的线性斜率，斜率为正且陡峭说明主力持续买入。
  */
 public class StockAnalyzer {
 
@@ -37,17 +42,20 @@ public class StockAnalyzer {
 
     // =========================================================
     // 各指标权重配置（依据 IC 检验结论调整，合计 1.00）
-    //   已移除：VOL_RATIO（无效）、BOLL_WIDTH（无效）
-    //   降权：KDJ（IC 方向反向，信息量弱）、BOLL_POS（弱）
-    //   升权：MA_SCORE（最强）、MOMENTUM_20（中期动量强）、MACD
+    //   已移除：VOL_RATIO（无效）、BOLL_WIDTH（无效）、BOLL_POS（弱，降至0）
+    //   降权：KDJ（IC 方向反向，信息量弱）、MA（调降为新因子腾空间）
+    //   升权：OBV_SLOPE（[P3-2]资金流入中等有效）、WEEK52_POS（[P1-2]低位吸筹）
+    //   新增：OBV_SLOPE（权重0.10）、WEEK52_POS（权重0.05）
     // =========================================================
-    private static final double WEIGHT_MA         = 0.28;  // MA多头排列（最强因子）
-    private static final double WEIGHT_MOMENTUM20 = 0.20;  // 20日动量（中期趋势延续）
-    private static final double WEIGHT_MACD       = 0.20;  // MACD（中等有效）
-    private static final double WEIGHT_MOMENTUM5  = 0.12;  // 5日动量（短期，谨慎）
-    private static final double WEIGHT_RSI        = 0.10;  // RSI（弱，保留超卖信号）
-    private static final double WEIGHT_KDJ        = 0.06;  // KDJ（弱/反向，降权）
-    private static final double WEIGHT_BOLLINGER  = 0.04;  // 布林位置（弱，保留极值信号）
+    private static final double WEIGHT_MA         = 0.25;  // MA多头排列（最强因子，调降0.03）
+    private static final double WEIGHT_MOMENTUM20 = 0.18;  // 20日动量（中期趋势延续）
+    private static final double WEIGHT_MACD       = 0.18;  // MACD（中等有效）
+    private static final double WEIGHT_MOMENTUM5  = 0.11;  // 5日动量（短期，谨慎）
+    private static final double WEIGHT_OBV_SLOPE  = 0.10;  // [P3-2] OBV斜率（资金持续流入）
+    private static final double WEIGHT_RSI        = 0.09;  // RSI（弱，保留超卖信号）
+    private static final double WEIGHT_WEEK52_POS = 0.05;  // [P1-2] 52周位置（低位加分）
+    private static final double WEIGHT_KDJ        = 0.05;  // KDJ（弱/反向，继续降权）
+    private static final double WEIGHT_BOLLINGER  = 0.00;  // 布林位置（IC无效，移除）
     // WEIGHT_VOLUME = 0  VOL_RATIO IC<0.02，移除
 
     // RSI阈值
@@ -109,12 +117,21 @@ public class StockAnalyzer {
         double momentum5  = (n >= 6  && closes[n - 6]  > 0) ? (closes[n - 1] - closes[n - 6])  / closes[n - 6]  : 0.0;
         double momentum20 = (n >= 21 && closes[n - 21] > 0) ? (closes[n - 1] - closes[n - 21]) / closes[n - 21] : 0.0;
 
+        // [P3-2] OBV（能量潮）斜率：近20日OBV的线性回归斜率，归一化为相对斜率
+        double[] obvArr = TechnicalIndicator.obvArray(bars);
+        double obvSlope = calcObvSlope(obvArr, Math.min(20, obvArr.length));
+
+        // [P1-2] 52周位置因子：当前价 / 52周最高价（约250个交易日）
+        // 低位（比值<0.7）：距新高空间大，吸筹机会；高位（>0.95）：追高风险
+        double week52Position = calcWeek52Position(closes, currentPrice);
+
         // ===== 综合评分 =====
         Map<String, Integer> scores = calculateScores(
                 currentPrice, closes,
                 latestMa5, latestMa10, latestMa20, latestMa60,
                 macdResult, latestRsi6, latestRsi12, kdjResult,
-                bollingerResult, momentum5, momentum20
+                bollingerResult, momentum5, momentum20,
+                obvSlope, week52Position
         );
 
         int overallScore = calculateOverallScore(scores);
@@ -181,8 +198,10 @@ public class StockAnalyzer {
      * 依据 IC 检验结论重构：
      * <ul>
      *   <li>新增 momentum5 / momentum20 得分（IC 有效因子）</li>
+     *   <li>[P3-2] 新增 obvSlope 得分（OBV斜率，资金持续流入信号）</li>
+     *   <li>[P1-2] 新增 week52Position 得分（52周位置，低位加分）</li>
      *   <li>移除 volume 得分（IC 检验无效，VOL_RATIO |IC|均值 < 0.02）</li>
-     *   <li>布林带仅保留极值信号，降低其影响力</li>
+     *   <li>布林带权重降至0（IC无效，仅保留数据不参与评分）</li>
      * </ul>
      */
     private Map<String, Integer> calculateScores(
@@ -192,7 +211,8 @@ public class StockAnalyzer {
             double rsi6, double rsi12,
             TechnicalIndicator.KDJResult kdj,
             TechnicalIndicator.BollingerResult bollinger,
-            double momentum5, double momentum20) {
+            double momentum5, double momentum20,
+            double obvSlope, double week52Position) {
 
         Map<String, Integer> scores = new HashMap<>();
 
@@ -287,7 +307,7 @@ public class StockAnalyzer {
         else                        mom5Score = 32;  // 近5日跌幅>5%，动量弱
         scores.put("momentum5", mom5Score);
 
-        // === 20日动量得分（IC最强之一，权重0.20）===
+        // === 20日动量得分（IC最强之一，权重0.18）===
         // 中期趋势延续性最强
         int mom20Score;
         if (momentum20 > 0.15)       mom20Score = 78;  // 近20日涨幅>15%，强势
@@ -299,22 +319,113 @@ public class StockAnalyzer {
         else                         mom20Score = 26;  // 近20日跌幅>10%，趋势弱
         scores.put("momentum20", mom20Score);
 
+        // === [P3-2] OBV斜率得分（权重0.10）===
+        // OBV斜率 > 0 且陡峭：主力持续流入，是可靠的多头信号
+        // 斜率为负且陡峭：主力持续流出，空头风险高
+        // obvSlope 已经过归一化（相对于OBV均值，单位：%/日）
+        int obvScore;
+        if (obvSlope > 2.0)       obvScore = 78;  // OBV日均增速>2%，主力强力买入
+        else if (obvSlope > 0.8)  obvScore = 68;
+        else if (obvSlope > 0.2)  obvScore = 60;
+        else if (obvSlope >= 0)   obvScore = 53;  // 轻微正斜率，中性偏多
+        else if (obvSlope > -0.5) obvScore = 44;  // 轻微负斜率，中性偏空
+        else if (obvSlope > -1.5) obvScore = 36;
+        else                      obvScore = 26;  // OBV持续下行，主力出货
+        scores.put("obvSlope", clamp(obvScore));
+
+        // === [P1-2] 52周位置得分（权重0.05）===
+        // week52Position = 当前价 / 52周最高价（0~1之间）
+        //   < 0.6（低位）：距历史高点空间大，低吸机会，加分
+        //   0.6~0.85（中位）：正常区间，中性
+        //   > 0.9（高位接近新高）：追高风险，减分
+        //   > 0.98（创新高区域）：突破行情，加分（趋势延续）
+        int week52Score;
+        if (week52Position <= 0)    week52Score = 50; // 数据不足，中性
+        else if (week52Position > 0.98) week52Score = 70; // 突破52周新高，强势趋势延续
+        else if (week52Position > 0.90) week52Score = 38; // 高位追高风险
+        else if (week52Position > 0.75) week52Score = 50; // 中位，中性
+        else if (week52Position > 0.60) week52Score = 60; // 中低位，有吸筹价值
+        else                            week52Score = 68; // 低位（<60%）：低估值+吸筹机会
+        scores.put("week52Position", clamp(week52Score));
+
         return scores;
     }
 
     /**
      * 加权计算综合得分（依据 IC 检验结论调整权重）
+     * [P1-2][P3-2] 新增 obvSlope 和 week52Position 两个因子的加权
      */
     private int calculateOverallScore(Map<String, Integer> scores) {
         double weighted =
-                scores.getOrDefault("ma", 50)         * WEIGHT_MA         +
-                scores.getOrDefault("momentum20", 50) * WEIGHT_MOMENTUM20 +
-                scores.getOrDefault("macd", 50)       * WEIGHT_MACD       +
-                scores.getOrDefault("momentum5", 50)  * WEIGHT_MOMENTUM5  +
-                scores.getOrDefault("rsi", 50)        * WEIGHT_RSI        +
-                scores.getOrDefault("kdj", 50)        * WEIGHT_KDJ        +
-                scores.getOrDefault("bollinger", 50)  * WEIGHT_BOLLINGER;
+                scores.getOrDefault("ma", 50)            * WEIGHT_MA         +
+                scores.getOrDefault("momentum20", 50)    * WEIGHT_MOMENTUM20 +
+                scores.getOrDefault("macd", 50)          * WEIGHT_MACD       +
+                scores.getOrDefault("momentum5", 50)     * WEIGHT_MOMENTUM5  +
+                scores.getOrDefault("obvSlope", 50)      * WEIGHT_OBV_SLOPE  +
+                scores.getOrDefault("rsi", 50)           * WEIGHT_RSI        +
+                scores.getOrDefault("week52Position", 50) * WEIGHT_WEEK52_POS +
+                scores.getOrDefault("kdj", 50)           * WEIGHT_KDJ        +
+                scores.getOrDefault("bollinger", 50)     * WEIGHT_BOLLINGER;
         return (int) Math.round(weighted);
+    }
+
+    /**
+     * [P3-2] 计算 OBV 近 N 日的线性斜率，归一化为相对增速（%/日）
+     * <p>
+     * 原理：用最小二乘法拟合 OBV 时序的线性趋势，斜率为正说明 OBV 持续上升（资金流入）；
+     * 为消除不同股票 OBV 绝对值量级差异，将斜率除以 OBV 均值的绝对值归一化。
+     *
+     * @param obvArr OBV 数组（时间升序）
+     * @param window 计算窗口（取最近 window 个点）
+     * @return 归一化 OBV 斜率（%/日），正值=主力买入，负值=主力出货
+     */
+    private double calcObvSlope(double[] obvArr, int window) {
+        if (obvArr == null || obvArr.length < 4 || window < 4) return 0.0;
+        int n = Math.min(window, obvArr.length);
+        int start = obvArr.length - n;
+
+        // 最小二乘法：计算斜率 k = (n*Σxy - Σx*Σy) / (n*Σx² - (Σx)²)
+        double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+        double sumAbsY = 0;
+        for (int i = 0; i < n; i++) {
+            double x = i;
+            double y = obvArr[start + i];
+            sumX += x;
+            sumY += y;
+            sumXY += x * y;
+            sumX2 += x * x;
+            sumAbsY += Math.abs(y);
+        }
+        double denominator = n * sumX2 - sumX * sumX;
+        if (denominator == 0) return 0.0;
+        double slope = (n * sumXY - sumX * sumY) / denominator;
+
+        // 归一化：斜率 / OBV均值绝对值 * 100（单位：% per bar）
+        double avgAbsY = sumAbsY / n;
+        if (avgAbsY < 1) return 0.0; // OBV太小，不可信
+        return slope / avgAbsY * 100.0;
+    }
+
+    /**
+     * [P1-2] 计算 52 周位置因子（当前价 / 52周最高价）
+     * <p>
+     * 52周最高价取最近 min(250, n) 根 K 线中的最高收盘价。
+     * 若 K 线数量不足，降级取现有数据的最高点。
+     *
+     * @param closes    收盘价数组（时间升序）
+     * @param currentPrice 当前价格
+     * @return 位置比率 [0, 1+]，> 1 说明当前价超过历史最高
+     */
+    private double calcWeek52Position(double[] closes, double currentPrice) {
+        if (closes == null || closes.length < 5 || currentPrice <= 0) return 0.0;
+        int window = Math.min(250, closes.length);
+        int start = closes.length - window;
+        double high52 = 0;
+        for (int i = start; i < closes.length; i++) {
+            if (closes[i] > high52) high52 = closes[i];
+        }
+        if (high52 <= 0) return 0.0;
+        return currentPrice / high52;
     }
 
     /**

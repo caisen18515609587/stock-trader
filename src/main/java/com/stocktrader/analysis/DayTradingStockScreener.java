@@ -3,10 +3,14 @@ package com.stocktrader.analysis;
 import com.stocktrader.datasource.StockDataProvider;
 import com.stocktrader.model.AnalysisResult;
 import com.stocktrader.model.StockBar;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -65,9 +69,33 @@ public class DayTradingStockScreener {
     /** 近5日日均成交额最低（万元） */
     private static final double MIN_AVG_AMOUNT_W   = 3000.0;  // 3000万（原5000万，适当放宽）
 
+    // [P1-3] 集合竞价强度过滤参数
+    /** 集合竞价买卖量比最低阈值（买盘意愿强） */
+    private static final double MIN_BID_ASK_RATIO  = 1.2;    // 买一量/卖一量 >= 1.2
+    /** 集合竞价涨幅下限（避免追高） */
+    private static final double AUCTION_CHANGE_MIN  = 0.005;  // 0.5%
+    /** 集合竞价涨幅上限（避免追高） */
+    private static final double AUCTION_CHANGE_MAX  = 0.05;   // 5%
+    /** 数据服务地址（竞价实时行情接口） */
+    private static final String AUCTION_API_URL = "http://localhost:8099/auction_realtime";
+
+    /** HTTP客户端（懒加载） */
+    private static OkHttpClient httpClient;
+
     public DayTradingStockScreener(StockDataProvider dataProvider) {
         this.dataProvider = dataProvider;
         this.analyzer = new StockAnalyzer();
+    }
+
+    /** 获取共享的HTTP客户端 */
+    private static synchronized OkHttpClient getHttpClient() {
+        if (httpClient == null) {
+            httpClient = new OkHttpClient.Builder()
+                    .connectTimeout(10, TimeUnit.SECONDS)
+                    .readTimeout(30, TimeUnit.SECONDS)
+                    .build();
+        }
+        return httpClient;
     }
 
     /**
@@ -128,18 +156,36 @@ public class DayTradingStockScreener {
     public DayTradingCandidate selectBestForDayTrading() {
         log.info("====== 开始做T选股扫描（目标：选出最优1支）======");
 
+        // [P1-3] 检查是否在集合竞价窗口（9:15~9:30），使用竞价强度过滤
+        LocalTime now = LocalTime.now();
+        boolean isAuctionWindow = now.isAfter(LocalTime.of(9, 14)) && now.isBefore(LocalTime.of(9, 31));
+
         // Step1: 获取全量A股行情快照
-        StockScreener tempScreener = new StockScreener(dataProvider);
-        List<Map<String, Object>> allQuotes = tempScreener.fetchAllStockQuotes();
-        log.info("获取全量A股行情：{}只", allQuotes.size());
+        List<Map<String, Object>> allQuotes;
+        if (isAuctionWindow) {
+            // [P1-3] 集合竞价窗口：使用竞价实时接口
+            allQuotes = fetchAuctionRealtime();
+            log.info("[P1-3] 集合竞价窗口，使用竞价实时接口，获取{}只", allQuotes.size());
+        } else {
+            StockScreener tempScreener = new StockScreener(dataProvider);
+            allQuotes = tempScreener.fetchAllStockQuotes();
+            log.info("获取全量A股行情：{}只", allQuotes.size());
+        }
 
         // Step2: 预筛选（去掉明显不适合做T的股票）
         List<Map<String, Object>> candidates = preFilterForDayTrading(allQuotes);
         log.info("预筛选后做T候选：{}只", candidates.size());
 
+        // [P1-3] Step2.5: 集合竞价强度过滤（仅在竞价窗口内执行）
+        if (isAuctionWindow && !candidates.isEmpty()) {
+            candidates = filterByAuctionStrength(candidates);
+            log.info("[P1-3] 集合竞价强度过滤后候选：{}只", candidates.size());
+        }
+
         if (candidates.isEmpty()) {
             log.warn("做T预筛选无结果，降级使用全量行情");
-            candidates = allQuotes;
+            StockScreener tempScreener = new StockScreener(dataProvider);
+            candidates = preFilterForDayTrading(tempScreener.fetchAllStockQuotes());
         }
 
         // Step3: 并行获取K线，计算做T综合评分
@@ -174,10 +220,25 @@ public class DayTradingStockScreener {
     public List<DayTradingCandidate> selectTopForDayTrading(int topN) {
         log.info("====== 开始做T选股扫描（目标：选出Top{}支）======", topN);
 
-        StockScreener tempScreener = new StockScreener(dataProvider);
-        List<Map<String, Object>> allQuotes = tempScreener.fetchAllStockQuotes();
+        // [P1-3] 检查是否在集合竞价窗口
+        LocalTime now = LocalTime.now();
+        boolean isAuctionWindow = now.isAfter(LocalTime.of(9, 14)) && now.isBefore(LocalTime.of(9, 31));
+
+        List<Map<String, Object>> allQuotes;
+        if (isAuctionWindow) {
+            allQuotes = fetchAuctionRealtime();
+        } else {
+            StockScreener tempScreener = new StockScreener(dataProvider);
+            allQuotes = tempScreener.fetchAllStockQuotes();
+        }
 
         List<Map<String, Object>> candidates = preFilterForDayTrading(allQuotes);
+
+        // [P1-3] 集合竞价强度过滤
+        if (isAuctionWindow && !candidates.isEmpty()) {
+            candidates = filterByAuctionStrength(candidates);
+        }
+
         if (candidates.isEmpty()) candidates = allQuotes;
 
         List<DayTradingCandidate> results = scoreCandidates(candidates);
@@ -189,6 +250,91 @@ public class DayTradingStockScreener {
             log.info("  第{}名: {}", i + 1, topList.get(i));
         }
         return topList;
+    }
+
+    // ===== [P1-3] 集合竞价强度过滤相关方法 =====
+
+    /**
+     * [P1-3] 获取集合竞价实时行情
+     * 从数据服务的 /auction_realtime 接口获取全市场竞价数据
+     */
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> fetchAuctionRealtime() {
+        List<Map<String, Object>> result = new ArrayList<>();
+        try {
+            OkHttpClient client = getHttpClient();
+            Request request = new Request.Builder().url(AUCTION_API_URL).get().build();
+            try (Response response = client.newCall(request).execute()) {
+                if (!response.isSuccessful() || response.body() == null) {
+                    log.warn("[P1-3] 竞价接口请求失败: {}", response.code());
+                    return result;
+                }
+                String json = response.body().string();
+                // 简单JSON解析（使用StockScreener中的方法）
+                result = parseJsonArray(json);
+            }
+        } catch (Exception e) {
+            log.warn("[P1-3] 获取竞价实时行情异常: {}", e.getMessage());
+        }
+        return result;
+    }
+
+    /**
+     * [P1-3] 集合竞价强度过滤
+     * 筛选条件：
+     *   - 竞价涨幅 0.5%~5%（有明确方向，但不追高）
+     *   - 买一量/卖一量 >= 1.2（买盘意愿强）
+     */
+    private List<Map<String, Object>> filterByAuctionStrength(List<Map<String, Object>> quotes) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        int filteredByChange = 0, filteredByRatio = 0;
+
+        for (Map<String, Object> q : quotes) {
+            double changePct = toDouble(q.get("changePercent"));
+            double bidAskRatio = toDouble(q.get("bidAskRatio"));
+
+            // 竞价涨幅过滤：0.5% ~ 5%
+            if (changePct < AUCTION_CHANGE_MIN * 100 || changePct > AUCTION_CHANGE_MAX * 100) {
+                filteredByChange++;
+                continue;
+            }
+
+            // 买卖量比过滤：买盘意愿强
+            // 注：部分股票可能没有 bidAskRatio 数据（非竞价时段或数据源不支持），此时跳过此过滤
+            if (bidAskRatio > 0 && bidAskRatio < MIN_BID_ASK_RATIO) {
+                filteredByRatio++;
+                continue;
+            }
+
+            result.add(q);
+        }
+
+        if (filteredByChange > 0 || filteredByRatio > 0) {
+            log.debug("[P1-3] 竞价强度过滤：涨幅范围过滤{}只，买卖量比过滤{}只，剩余{}只",
+                    filteredByChange, filteredByRatio, result.size());
+        }
+
+        return result;
+    }
+
+    /**
+     * 简单JSON数组解析（避免引入Jackson依赖）
+     * 解析 [{"key": value, ...}, ...] 格式
+     */
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> parseJsonArray(String json) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        try {
+            // 使用StockScreener中的解析逻辑（委托）
+            StockScreener tempScreener = new StockScreener(dataProvider);
+            // 尝试反射调用 parseJsonArray 方法，如果失败则使用简化解析
+            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+            result = mapper.readValue(json,
+                    new com.fasterxml.jackson.core.type.TypeReference<List<Map<String, Object>>>() {});
+        } catch (Exception e) {
+            log.warn("[P1-3] JSON解析失败: {}", e.getMessage());
+        }
+        return result;
     }
 
     /**

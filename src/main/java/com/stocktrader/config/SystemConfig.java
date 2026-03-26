@@ -26,7 +26,7 @@ public class SystemConfig {
     private static final Logger log = LoggerFactory.getLogger(SystemConfig.class);
     private static final String CONFIG_FILE = "application.properties";
 
-    private static SystemConfig instance;
+    private static volatile SystemConfig instance;
     private final Properties props;
 
     private SystemConfig() {
