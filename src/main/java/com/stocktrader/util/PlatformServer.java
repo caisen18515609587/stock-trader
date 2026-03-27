@@ -448,6 +448,8 @@ public class PlatformServer {
         }
 
         // ===== 其他策略：启动标准 AutoTrader =====
+        // 读取用户市场配置（HK=港股模式，CN/null=A股模式）
+        String userMarket = user.getMarket() != null ? user.getMarket() : "CN";
         AutoTrader trader = new AutoTrader(
                 dataProvider,
                 user.getInitialCapital(),
@@ -461,7 +463,8 @@ public class PlatformServer {
                 sc,
                 user.getStrategyType(),
                 user.getWechatOpenId(),
-                user.getWechatSendKey()
+                user.getWechatSendKey(),
+                userMarket
         );
 
         // ===== 实盘模式：如全局配置启用 live_trade，则注入 QMT 适配器 =====

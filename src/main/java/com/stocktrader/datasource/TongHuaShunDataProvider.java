@@ -762,9 +762,22 @@ public class TongHuaShunDataProvider implements StockDataProvider {
      */
     private List<StockBar> getDailyBarsHk(String stockCode, LocalDate startDate, LocalDate endDate,
                                             StockBar.AdjustType adjustType) {
+        // ===== 优先通过 Python 数据服务获取港股K线（代理东方财富，绕过直连限制）=====
+        List<StockBar> pyBars = getDailyBarsFromPythonHk(stockCode, startDate, endDate, adjustType);
+        if (!pyBars.isEmpty()) {
+            return pyBars;
+        }
+
+        // ===== 降级：直连东方财富港股K线接口 =====
         int adjFlag = adjustType == StockBar.AdjustType.FORWARD ? 1 :
                 (adjustType == StockBar.AdjustType.BACKWARD ? 2 : 0);
-        String normalizedCode = String.format("%05d", Integer.parseInt(stockCode));
+        String normalizedCode;
+        try {
+            normalizedCode = String.format("%05d", Integer.parseInt(stockCode.replaceAll("^(hk|HK)", "")));
+        } catch (NumberFormatException nfe) {
+            log.warn("港股代码格式无效，无法获取K线: {}", stockCode);
+            return new ArrayList<>();
+        }
         // 尝试 116（港股通南向）和 128（港交所）
         int[] markets = {116, 128};
         for (int market : markets) {
@@ -791,6 +804,61 @@ public class TongHuaShunDataProvider implements StockDataProvider {
         }
         log.warn("港股{}所有市场代码均无数据", stockCode);
         return new ArrayList<>();
+    }
+
+    /**
+     * 通过 Python 数据服务的 /hk_kline 接口获取港股日K线
+     * Python 服务已接入东方财富港股行情，并做了缓存和错误处理
+     */
+    private List<StockBar> getDailyBarsFromPythonHk(String stockCode, LocalDate startDate,
+                                                     LocalDate endDate, StockBar.AdjustType adjustType) {
+        try {
+            String adj = adjustType == StockBar.AdjustType.FORWARD ? "qfq" :
+                         adjustType == StockBar.AdjustType.BACKWARD ? "hfq" : "none";
+            String url = String.format("%s/hk_kline?code=%s&start=%s&end=%s&adj=%s",
+                    PYTHON_DATA_SERVICE, stockCode,
+                    startDate.format(DATE_FORMAT),
+                    endDate.format(DATE_FORMAT),
+                    adj);
+
+            String body = httpGet(url);
+            if (body == null || body.trim().isEmpty() || body.trim().startsWith("{\"error")) {
+                return new ArrayList<>();
+            }
+
+            JsonNode arr = objectMapper.readTree(body);
+            if (!arr.isArray() || arr.size() == 0) return new ArrayList<>();
+
+            List<StockBar> bars = new ArrayList<>();
+            for (JsonNode item : arr) {
+                try {
+                    String dateStr = item.path("date").asText();
+                    LocalDate date = LocalDate.parse(dateStr, DateTimeFormatter.ofPattern("yyyyMMdd"));
+                    StockBar bar = StockBar.builder()
+                            .stockCode(stockCode)
+                            .dateTime(date.atStartOfDay())
+                            .open(item.path("open").asDouble())
+                            .high(item.path("high").asDouble())
+                            .low(item.path("low").asDouble())
+                            .close(item.path("close").asDouble())
+                            .volume((long) item.path("volume").asDouble())
+                            .amount(item.path("amount").asDouble())
+                            .period(StockBar.BarPeriod.DAILY)
+                            .adjustType(adjustType)
+                            .build();
+                    bars.add(bar);
+                } catch (Exception e) {
+                    log.debug("解析Python港股K线行失败: {}", item);
+                }
+            }
+            if (!bars.isEmpty()) {
+                log.debug("[港股K线] Python数据服务返回: {} {}条K线", stockCode, bars.size());
+            }
+            return bars;
+        } catch (Exception e) {
+            log.debug("[港股K线] Python数据服务不可用: {}", e.getMessage());
+            return new ArrayList<>();
+        }
     }
 
     /**

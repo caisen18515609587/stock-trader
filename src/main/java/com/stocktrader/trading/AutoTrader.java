@@ -451,6 +451,21 @@ public class AutoTrader {
                       String userId, String username, String accountDir, String reportDir,
                       StrategyConfig sc, User.StrategyType strategyType,
                       String wechatOpenId, String wechatSendKey) {
+        this(dataProvider, initialCapital, topN, minScore, scanIntervalMin,
+                userId, username, accountDir, reportDir, sc, strategyType, wechatOpenId, wechatSendKey, "CN");
+    }
+
+    /**
+     * 多用户模式构造函数（含市场参数，用于港股/A股账户隔离）
+     *
+     * @param market 交易市场（"HK"=港股模式，"CN"=A股模式）
+     *               港股模式：使用港股时段(09:30~16:00无午休)、恒生指数大盘择时、港股选股器
+     */
+    public AutoTrader(StockDataProvider dataProvider, double initialCapital,
+                      int topN, int minScore, int scanIntervalMin,
+                      String userId, String username, String accountDir, String reportDir,
+                      StrategyConfig sc, User.StrategyType strategyType,
+                      String wechatOpenId, String wechatSendKey, String market) {
         this.dataProvider = dataProvider;
         this.initialCapital = initialCapital;
         this.topN = topN;
@@ -469,6 +484,11 @@ public class AutoTrader {
         this.analyzer = new StockAnalyzer();
         this.feeCalculator = new FeeCalculator();
         this.persistence = new AccountPersistence(accountDir);
+        // 根据 market 参数初始化市场模式（港股/A股），后续 updateHkMode() 会动态调整
+        this.hkMode = "HK".equalsIgnoreCase(market);
+        if (this.hkMode) {
+            log.info("[市场模式] 账户 {} 初始化为港股模式（HK）", username != null ? username : userId);
+        }
         // 根据策略类型和配置创建策略实例
         // MEDIUM_LONG（中长期）和 SWAP_STRONG（换股/汰弱留强）均使用 MediumLongTermStrategy：
         //   两者核心逻辑相同（持有强势股+止盈止损），区别仅在 AutoTrader 的换股调度行为上
@@ -803,6 +823,14 @@ public class AutoTrader {
             if (isHkCode(code)) hkCount++;
         }
         boolean newMode = hkCount > watchlist.size() / 2;
+        // [港股保护] 若账户通过构造函数初始化为港股模式（hkMode=true），
+        // 但 Fallback 监控池中恰好全是 A 股代码时，不允许自动降级为 A 股模式。
+        // 市场模式切换仅在两个方向均有足够股票数据时才执行（防止 Fallback 池污染市场模式）。
+        if (!newMode && hkMode && hkCount == 0) {
+            // 港股选股失败后用了 A 股 Fallback，但这是临时状态，不应重置市场模式
+            log.debug("[市场模式] 监控池中无港股代码（可能是选股Fallback），保持当前港股模式不变");
+            return;
+        }
         if (newMode != hkMode) {
             hkMode = newMode;
             log.info("[市场模式切换] {} → {} (港股{}只/共{}只)",
@@ -1605,14 +1633,19 @@ public class AutoTrader {
             log.info("[{}] 今天是周末，市场休市，跳过扫描", nowCheck.format(TIME_FMT));
             return;
         }
-        if (nowCheck.isBefore(MARKET_OPEN) || nowCheck.isAfter(MARKET_CLOSE)) {
-            log.info("[{}] 当前非交易时段（{}~{}），跳过扫描",
-                    nowCheck.format(TIME_FMT), MARKET_OPEN, MARKET_CLOSE);
-            return;
-        }
-        if (nowCheck.isAfter(NOON_BREAK_START) && nowCheck.isBefore(NOON_BREAK_END)) {
-            log.info("[{}] 午休时间（{}~{}），跳过扫描",
-                    nowCheck.format(TIME_FMT), NOON_BREAK_START, NOON_BREAK_END);
+        if (!isInTradingHours(nowCheck)) {
+            if (hkMode) {
+                log.info("[{}] 当前非港股交易时段（{}~{}），跳过扫描",
+                        nowCheck.format(TIME_FMT), HK_MARKET_OPEN, HK_MARKET_CLOSE);
+            } else {
+                if (nowCheck.isAfter(NOON_BREAK_START) && nowCheck.isBefore(NOON_BREAK_END)) {
+                    log.info("[{}] 午休时间（{}~{}），跳过扫描",
+                            nowCheck.format(TIME_FMT), NOON_BREAK_START, NOON_BREAK_END);
+                } else {
+                    log.info("[{}] 当前非交易时段（{}~{}），跳过扫描",
+                            nowCheck.format(TIME_FMT), MARKET_OPEN, MARKET_CLOSE);
+                }
+            }
             return;
         }
         // ===== 时间检查通过，尝试获取交易锁，执行扫描 =====
@@ -2870,6 +2903,16 @@ public class AutoTrader {
     private List<String> buildFallbackWatchlist() {
         double availableCash = portfolio != null ? portfolio.getAvailableCash() : initialCapital;
         List<String> fallback;
+        // ===== 港股模式：使用港股蓝筹保底池，避免误用 A 股代码导致 hkMode 被重置 =====
+        if (hkMode) {
+            // 港股蓝筹保底池（腾讯/汇丰/建行/工行/中移动/友邦/港交所/阿里巴巴）
+            fallback = Arrays.asList("00700", "00005", "00939", "01398", "00941", "01299", "00388", "09988");
+            // 按资金规模截取（小资金账户只监控前几只流动性最好的）
+            int limit = (availableCash >= 50_000) ? 6 : (availableCash >= 5_000) ? 4 : 2;
+            fallback = fallback.subList(0, Math.min(limit, fallback.size()));
+            log.warn("[Fallback监控池] 港股账户，使用港股蓝筹保底池（{}只）：{}", fallback.size(), fallback);
+            return fallback;
+        }
         if (availableCash >= 500_000) {
             // 大资金：保留原有蓝筹池
             fallback = Arrays.asList("600519", "300750", "002594"); // 茅台/宁德/比亚迪
@@ -2914,6 +2957,29 @@ public class AutoTrader {
             double  techWeight      = cfg.getFundamentalTechWeight();
             double  roeMin          = cfg.getFundamentalRoeMin();
             double  revenueYoyMin   = cfg.getFundamentalRevenueYoyMin();
+
+            // ===== 港股模式：直接使用港股选股器，不走A股逻辑 =====
+            if (hkMode) {
+                log.info("[港股选股] 当前为港股模式，使用港股全市场选股器...");
+                List<StockScreener.ScreenResult> hkResults = screener.screenTopHkStocks(topN * 3, minScore);
+                if (hkResults.isEmpty()) {
+                    log.warn("[港股选股] 无结果（评分>{}），降低门槛重试...", minScore);
+                    hkResults = screener.screenTopHkStocks(topN * 3, Math.max(minScore - 10, 40));
+                }
+                if (!hkResults.isEmpty()) {
+                    screenResults = hkResults;
+                    Set<String> newWatch = new LinkedHashSet<>(portfolio.getPositions().keySet());
+                    for (StockScreener.ScreenResult r : hkResults) {
+                        if (newWatch.size() >= topN * 2) break;
+                        newWatch.add(r.stockCode);
+                    }
+                    watchlist = new ArrayList<>(newWatch);
+                    log.info("[港股选股] 监控池更新（共{}只）：{}", watchlist.size(), watchlist);
+                    // 港股模式下 watchlist 全为港股，updateHkMode 应维持 hkMode=true
+                    updateHkMode();
+                }
+                return;
+            }
 
             // [资金过滤] 根据账户可用资金计算最大可买股价，过滤买不起的高价股
             // 逻辑：至少能买1手（100股），若 availableCash < price*100 则买不起

@@ -215,11 +215,13 @@ public class DatabaseManager {
             "  initial_capital  REAL NOT NULL DEFAULT 100000," +
             "  strategy_type    TEXT NOT NULL DEFAULT 'DAY_TRADE'," +
             "  strategy_config  TEXT," +
+            "  wechat_open_id   TEXT DEFAULT ''," +
             "  wechat_send_key  TEXT," +
             "  status           TEXT NOT NULL DEFAULT 'ACTIVE'," +
             "  is_super_admin   INTEGER NOT NULL DEFAULT 0," +
             "  create_time      TEXT," +
-            "  last_login_time  TEXT" +
+            "  last_login_time  TEXT," +
+            "  market           TEXT NOT NULL DEFAULT 'CN'" +
             ")",
 
             // ===== 账户/投资组合表 =====

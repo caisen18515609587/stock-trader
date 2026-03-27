@@ -299,6 +299,238 @@ public class StockScreener {
     }
 
     /**
+     * 港股全市场扫描选股
+     * <p>
+     * 流程：
+     * 1. 从东方财富获取港股（港交所主板）实时行情快照
+     * 2. 预筛选：剔除停牌、异常股
+     * 3. 对候选股获取历史K线，计算技术指标综合评分
+     * 4. 按评分排序，返回Top N
+     *
+     * @param topN     选出前N支
+     * @param minScore 最低技术评分阈值（建议55以上，港股波动较大）
+     * @return 排序后的Top N港股选股结果
+     */
+    public List<ScreenResult> screenTopHkStocks(int topN, int minScore) {
+        log.info("[港股选股] 开始港股全市场扫描，目标选出Top{}只（最低评分{}）...", topN, minScore);
+
+        // Step1: 获取港股实时行情快照（东方财富港交所主板）
+        List<Map<String, Object>> allQuotes = fetchAllHkStockQuotes();
+        log.info("[港股选股] 获取港股行情：{}只", allQuotes.size());
+
+        if (allQuotes.isEmpty()) {
+            log.warn("[港股选股] 港股行情获取失败，返回空结果");
+            return new ArrayList<>();
+        }
+
+        // Step2: 预筛选（剔除停牌、低流动性、涨跌幅异常股）
+        List<Map<String, Object>> candidates = preFilterHk(allQuotes);
+        log.info("[港股选股] 预筛选后候选股票：{}只", candidates.size());
+
+        if (candidates.isEmpty()) {
+            log.warn("[港股选股] 预筛选无候选，降级取全量");
+            candidates = allQuotes;
+        }
+
+        // Step3: 并行获取K线并做技术分析
+        List<ScreenResult> results = analyzeWithKline(candidates, minScore);
+        log.info("[港股选股] 技术分析完成，符合条件（评分>={}）：{}只", minScore, results.size());
+
+        // Step4: 排序，取Top N
+        Collections.sort(results);
+        List<ScreenResult> topList = results.stream().limit(topN).collect(Collectors.toList());
+
+        log.info("====== [港股选股] 完成，Top{} ======", topN);
+        for (int i = 0; i < topList.size(); i++) {
+            ScreenResult r = topList.get(i);
+            log.info("  第{}名: {} {} 评分{}", i + 1, r.stockCode, r.stockName, r.techScore);
+        }
+        return topList;
+    }
+
+    // 港股蓝筹候选池（按市值/流动性排序，当东方财富全量接口不可用时使用）
+    private static final List<String> HK_BLUECHIP_POOL = Arrays.asList(
+        "00700", "00005", "00939", "01398", "00941", "01299",
+        "00388", "09988", "03690", "00883", "00011", "00002",
+        "01997", "00003", "02628", "02318", "00016", "01177",
+        "01810", "00669", "00027", "02382", "06862", "01066"
+    );
+
+    /**
+     * 从东方财富获取港股（港交所主板）全量实时行情快照
+     * 市场代码：m:128+t:3（主板），m:128+t:4（创业板）
+     * 当东方财富接口不可用时，降级为港股蓝筹固定池+新浪实时行情
+     */
+    private List<Map<String, Object>> fetchAllHkStockQuotes() {
+        // ===== 方案1：东方财富港股行情列表接口（全量）=====
+        String url = "https://push2.eastmoney.com/api/qt/clist/get?" +
+                "pn=1&pz=3000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2" +
+                "&fid=f3&fs=m:128+t:3,m:128+t:4" +
+                "&fields=f12,f14,f2,f3,f4,f8,f9,f10,f15,f16,f17,f18,f20,f21" +
+                "&_=" + System.currentTimeMillis();
+        try {
+            String body = httpGet(url);
+            com.fasterxml.jackson.databind.ObjectMapper om = new com.fasterxml.jackson.databind.ObjectMapper();
+            com.fasterxml.jackson.databind.JsonNode root = om.readTree(body);
+            com.fasterxml.jackson.databind.JsonNode items = root.path("data").path("diff");
+            if (!items.isArray()) throw new Exception("港股行情数据格式异常");
+
+            List<Map<String, Object>> all = new ArrayList<>();
+            for (com.fasterxml.jackson.databind.JsonNode item : items) {
+                String code = item.path("f12").asText("");
+                String name = item.path("f14").asText(code);
+                if (code.isEmpty()) continue;
+
+                double price         = item.path("f2").asDouble(0) / 1000.0;
+                double changePercent = item.path("f3").asDouble(0) / 100.0;
+                double change        = item.path("f4").asDouble(0) / 1000.0;
+                double turnoverRate  = item.path("f8").asDouble(0) / 100.0;
+                double pe            = item.path("f9").asDouble(0) / 100.0;
+                double volumeRatio   = item.path("f10").asDouble(0) / 100.0;
+                double high          = item.path("f15").asDouble(0) / 1000.0;
+                double low           = item.path("f16").asDouble(0) / 1000.0;
+                double open          = item.path("f17").asDouble(0) / 1000.0;
+                double prevClose     = item.path("f18").asDouble(0) / 1000.0;
+                double totalMarketCap = item.path("f20").asDouble(0) / 1e8;
+
+                if (price <= 0) continue;
+
+                Map<String, Object> q = new HashMap<>();
+                q.put("code",           code);
+                q.put("name",           name);
+                q.put("price",          price);
+                q.put("changePercent",  changePercent);
+                q.put("change",         change);
+                q.put("turnoverRate",   turnoverRate);
+                q.put("pe",             pe);
+                q.put("volumeRatio",    volumeRatio);
+                q.put("high",           high);
+                q.put("low",            low);
+                q.put("open",           open);
+                q.put("prevClose",      prevClose);
+                q.put("totalMarketCap", totalMarketCap);
+                q.put("market",         128);
+                all.add(q);
+            }
+            if (!all.isEmpty()) {
+                log.info("[港股选股] 东方财富港股行情获取成功，共{}只", all.size());
+                return all;
+            }
+            throw new Exception("港股行情列表为空");
+        } catch (Exception e) {
+            log.warn("[港股选股] 东方财富接口不可用（{}），降级使用蓝筹固定池+新浪实时行情", e.getMessage());
+        }
+
+        // ===== 方案2：降级 - 蓝筹固定池 + 新浪实时行情 =====
+        return fetchHkBluechipQuotesBySina();
+    }
+
+    /**
+     * 降级方案：用新浪财经实时行情接口批量获取港股蓝筹行情快照
+     * 新浪接口：https://hq.sinajs.cn/list=hk00700,hk00005,...
+     * 数据格式：股票名称,买价,现价,最高,最低,开盘,成交量,成交额,涨跌幅,...
+     */
+    private List<Map<String, Object>> fetchHkBluechipQuotesBySina() {
+        // 将代码列表转为新浪格式（hk00700,hk00005,...）
+        String codeList = HK_BLUECHIP_POOL.stream()
+                .map(c -> "hk" + String.format("%05d", Integer.parseInt(c)))
+                .reduce((a, b) -> a + "," + b)
+                .orElse("");
+        if (codeList.isEmpty()) return new ArrayList<>();
+
+        String sinaUrl = "https://hq.sinajs.cn/list=" + codeList;
+        List<Map<String, Object>> result = new ArrayList<>();
+        try {
+            String body = httpGet(sinaUrl);
+            if (body == null || body.isEmpty()) return result;
+
+            // 解析新浪港股行情（格式：var hq_str_hk00700="腾讯控股,491.2,495.6,...";）
+            String[] lines = body.split("\n");
+            for (int i = 0; i < lines.length && i < HK_BLUECHIP_POOL.size(); i++) {
+                String line = lines[i].trim();
+                if (line.isEmpty()) continue;
+                // 提取代码：hq_str_hk00700 -> 00700
+                int eq = line.indexOf('=');
+                if (eq < 0) continue;
+                String varName = line.substring(0, eq).trim();
+                String codeRaw = varName.replaceAll("var\\s+hq_str_hk", "").trim();
+                // 提取数据：去掉前后引号
+                int q1 = line.indexOf('"');
+                int q2 = line.lastIndexOf('"');
+                if (q1 < 0 || q2 <= q1) continue;
+                String data = line.substring(q1 + 1, q2);
+                String[] parts = data.split(",");
+                if (parts.length < 9) continue;
+
+                try {
+                    String name = parts[0];
+                    double prevClose = parseDouble(parts[1]);
+                    double price     = parseDouble(parts[2]);
+                    double high      = parseDouble(parts[3]);
+                    double low       = parseDouble(parts[4]);
+                    double open      = parseDouble(parts[5]);
+                    long   volume    = (long) parseDouble(parts[6]);
+                    double amount    = parseDouble(parts[7]);
+                    double changePct = prevClose > 0 ? (price - prevClose) / prevClose * 100.0 : 0;
+
+                    if (price <= 0) continue;
+
+                    Map<String, Object> q = new HashMap<>();
+                    q.put("code",           codeRaw);
+                    q.put("name",           name);
+                    q.put("price",          price);
+                    q.put("changePercent",  changePct);
+                    q.put("change",         price - prevClose);
+                    q.put("turnoverRate",   0.0);  // 新浪无换手率，设为0（预筛选不会因此过滤）
+                    q.put("pe",             0.0);
+                    q.put("volumeRatio",    1.0);
+                    q.put("high",           high);
+                    q.put("low",            low);
+                    q.put("open",           open);
+                    q.put("prevClose",      prevClose);
+                    q.put("totalMarketCap", 100.0); // 蓝筹市值默认100亿+，不会被过滤
+                    q.put("market",         116);   // 港股通
+                    result.add(q);
+                } catch (Exception ex) {
+                    log.debug("[港股蓝筹] 解析{}行情失败: {}", codeRaw, ex.getMessage());
+                }
+            }
+            log.info("[港股选股] 新浪蓝筹行情获取成功，共{}只", result.size());
+        } catch (Exception e) {
+            log.error("[港股选股] 新浪蓝筹行情获取失败: {}", e.getMessage());
+        }
+        return result;
+    }
+
+    /**
+     * 港股预筛选：剔除明显不适合的股票
+     * 港股无涨跌停限制，ST机制与A股不同，过滤条件相对宽松
+     */
+    private List<Map<String, Object>> preFilterHk(List<Map<String, Object>> quotes) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> q : quotes) {
+            String name  = (String) q.get("name");
+            double price = toDouble(q.get("price"));
+            double changePercent = toDouble(q.get("changePercent"));
+            double totalMarketCap = toDouble(q.get("totalMarketCap"));
+
+            // 剔除停牌（价格为0）
+            if (price <= 0) continue;
+            // 剔除仙股（价格 < 0.1 港元）
+            if (price < 0.1) continue;
+            // 剔除名称含"停牌"的股票
+            if (name != null && (name.contains("停牌") || name.contains("-B") && name.contains("债"))) continue;
+            // 剔除极端异常涨跌（±50%以上，可能是特殊停复牌）
+            if (Math.abs(changePercent) > 50) continue;
+            // 市值极小的股票流动性差（< 1亿港元）
+            if (totalMarketCap > 0 && totalMarketCap < 1) continue;
+
+            result.add(q);
+        }
+        return result;
+    }
+
+    /**
      * [P3-1] ROE 硬过滤：对技术面候选股批量查询ROE，排除低盈利能力股票
      * <p>
      * 设计原则：
@@ -808,6 +1040,107 @@ public class StockScreener {
         } catch (Exception e) {
             return 0;
         }
+    }
+
+    /**
+     * [P1-1] 主力资金流向过滤：剔除近3日主力持续净流出的股票
+     * <p>
+     * 调用东方财富个股资金流向接口，获取近3日主力净流入数据。
+     * 过滤条件：近3日主力净流入累计 < 0（持续流出），则降权或排除。
+     * <p>
+     * 接口：https://push2.eastmoney.com/api/qt/stock/fflow/kline/get
+     * 参数：lmt=0&klt=101&secid=市场.代码&fields1=f1,f2&fields2=f51,f52,f53,f54,f55
+     *
+     * @param quotes 候选股票行情列表
+     * @return 过滤后的候选股票列表
+     */
+    private List<Map<String, Object>> filterByMoneyFlow(List<Map<String, Object>> quotes) {
+        if (quotes == null || quotes.isEmpty()) return quotes;
+
+        List<Map<String, Object>> result = new ArrayList<>();
+        int filteredCount = 0;
+        int errorCount = 0;
+
+        for (Map<String, Object> q : quotes) {
+            String code = (String) q.get("code");
+            if (code == null || code.isEmpty()) {
+                result.add(q);
+                continue;
+            }
+
+            try {
+                // 构建东方财富资金流向接口地址
+                // secid格式：1=沪市（600/601/603/688开头），0=深市（000/002/300开头）
+                String market = (code.startsWith("6") || code.startsWith("9")) ? "1" : "0";
+                String url = EMC_MONEY_FLOW_URL +
+                        "?lmt=0&klt=101&secid=" + market + "." + code +
+                        "&fields1=f1,f2&fields2=f51,f52,f53,f54,f55" +
+                        "&ut=b2884a393a59ad64002292a3e90d46a5" +
+                        "&cb=jQuery&_=" + System.currentTimeMillis();
+
+                String json = httpGet(url);
+
+                // 解析响应（JSONP格式，需去除回调包装）
+                if (json == null || json.isEmpty()) {
+                    result.add(q); // 请求失败不过滤
+                    continue;
+                }
+                // 去掉JSONP包装 jQuery(...) -> {...}
+                int start = json.indexOf('{');
+                int end = json.lastIndexOf('}');
+                if (start < 0 || end < 0 || start >= end) {
+                    result.add(q);
+                    continue;
+                }
+                json = json.substring(start, end + 1);
+
+                com.fasterxml.jackson.databind.ObjectMapper mapper =
+                        new com.fasterxml.jackson.databind.ObjectMapper();
+                com.fasterxml.jackson.databind.JsonNode root = mapper.readTree(json);
+                com.fasterxml.jackson.databind.JsonNode klines = root.path("data").path("klines");
+
+                if (!klines.isArray() || klines.size() == 0) {
+                    result.add(q); // 无数据不过滤
+                    continue;
+                }
+
+                // 取近3日数据（最新的3条），计算主力净流入累计
+                // kline格式：日期,主力净流入,小单净流入,中单净流入,大单净流入,超大单净流入
+                double totalMainFlow = 0;
+                int days = Math.min(3, klines.size());
+                for (int i = klines.size() - days; i < klines.size(); i++) {
+                    String kline = klines.get(i).asText("");
+                    String[] parts = kline.split(",");
+                    if (parts.length >= 2) {
+                        try {
+                            totalMainFlow += Double.parseDouble(parts[1].trim()); // 主力净流入（元）
+                        } catch (NumberFormatException ignore) {}
+                    }
+                }
+
+                // 过滤条件：近3日主力累计净流出且超过-5000万
+                final double FILTER_THRESHOLD = -5.0e7; // -5000万
+                if (totalMainFlow < FILTER_THRESHOLD) {
+                    filteredCount++;
+                    log.debug("[P1-1] {} 近3日主力净流入={}万，持续流出，过滤",
+                            code, String.format("%.0f", totalMainFlow / 10000));
+                    continue;
+                }
+
+                result.add(q);
+
+            } catch (Exception e) {
+                errorCount++;
+                result.add(q); // 发生异常时保留，不过滤
+                log.debug("[P1-1] {} 资金流向查询异常: {}", code, e.getMessage());
+            }
+        }
+
+        if (filteredCount > 0 || errorCount > 0) {
+            log.info("[P1-1] 资金流向过滤：剔除主力持续流出{}只，查询异常{}只（保留），剩余{}只",
+                    filteredCount, errorCount, result.size());
+        }
+        return result;
     }
 
     private String httpGet(String url) throws Exception {

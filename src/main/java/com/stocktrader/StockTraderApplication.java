@@ -685,6 +685,44 @@ public class StockTraderApplication {
     }
 
     /**
+     * 初始化内置账户（首次启动自动创建，已存在则跳过）
+     * <p>
+     * 内置账户列表：
+     * - hktest：港股模拟交易账户，初始资金10万，密码123456，market=HK
+     */
+    private static void initBuiltInUsers(UserService userService) {
+        // ===== hktest：港股模拟账户 =====
+        if (!userService.getStore().usernameExists("hktest")) {
+            UserService.RegisterResult r = userService.register(
+                    "hktest",
+                    "123456",
+                    "港股模拟账户",
+                    100000.0,
+                    com.stocktrader.model.User.StrategyType.DAY_TRADE
+            );
+            if (r.success && r.user != null) {
+                // 设置港股市场标识
+                r.user.setMarket("HK");
+                userService.getStore().save(r.user);
+                log.info("内置港股账户已创建：hktest（market=HK，初始资金=10万）");
+            } else {
+                log.warn("创建内置港股账户失败：{}", r.message);
+            }
+        } else {
+            // 账户已存在，确保 market 字段为 HK
+            com.stocktrader.model.User hkUser = userService.getStore().findByUsername("hktest");
+            if (hkUser != null && !"HK".equals(hkUser.getMarket())) {
+                hkUser.setMarket("HK");
+                userService.getStore().save(hkUser);
+                log.info("内置港股账户 hktest 的 market 已更新为 HK");
+            } else {
+                log.debug("内置港股账户 hktest 已存在（market={}），跳过创建",
+                        hkUser != null ? hkUser.getMarket() : "unknown");
+            }
+        }
+    }
+
+    /**
      * 初始化超级管理员账户（仅供内部使用）
      * 用法: init-admin <用户名> <密码>
      */
@@ -737,6 +775,9 @@ public class StockTraderApplication {
 
         UserStore userStore = new UserStore(dataDir);
         UserService userService = new UserService(userStore);
+
+        // ===== 初始化内置账户（首次启动自动创建，已存在则跳过）=====
+        initBuiltInUsers(userService);
 
         PlatformServer server = new PlatformServer(port, userService, dataProvider);
         server.start();

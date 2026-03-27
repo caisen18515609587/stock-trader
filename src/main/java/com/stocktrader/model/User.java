@@ -70,6 +70,13 @@ public class User {
      */
     private boolean superAdmin;
 
+    /**
+     * 交易市场（默认 CN=A股，HK=港股）
+     * 用于账户级别的市场隔离：HK 账户使用港股时段、恒生指数大盘择时、港股选股器。
+     */
+    @Builder.Default
+    private String market = "CN";
+
     public enum StrategyType {
         MEDIUM_LONG("中长期策略"),
         DAY_TRADE("短线做T策略"),

@@ -91,13 +91,13 @@ public class UserStore {
 
     // =================== 数据库操作 ===================
 
-    /** INSERT OR REPLACE 到 t_user 表（含 wechat_open_id 字段） */
+    /** INSERT OR REPLACE 到 t_user 表（含 wechat_open_id、market 字段） */
     private void upsertToDb(User user) {
         String sql = "INSERT OR REPLACE INTO t_user(" +
                 "user_id, username, password_hash, nickname, email, initial_capital, " +
                 "strategy_type, strategy_config, wechat_open_id, wechat_send_key, status, is_super_admin, " +
-                "create_time, last_login_time) " +
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+                "create_time, last_login_time, market) " +
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
         // [P0-1 优化] 使用独立短连接避免并发冲突
         Connection conn = null;
         try {
@@ -117,6 +117,7 @@ public class UserStore {
                 ps.setInt(12,    user.isSuperAdmin() ? 1 : 0);
                 ps.setString(13, user.getCreateTime() != null ? user.getCreateTime().format(DT_FMT) : "");
                 ps.setString(14, user.getLastLoginTime() != null ? user.getLastLoginTime().format(DT_FMT) : "");
+                ps.setString(15, user.getMarket() != null ? user.getMarket() : "CN");
                 ps.executeUpdate();
             }
         } catch (SQLException e) {
@@ -143,13 +144,30 @@ public class UserStore {
         }
     }
 
+    /** 检测并添加 market 列（数据库升级兼容），仅在初始化时调用一次 */
+    private void ensureMarketColumn() {
+        Connection conn = null;
+        try {
+            conn = db.newConnection();
+            try (Statement st = conn.createStatement()) {
+                st.execute("ALTER TABLE t_user ADD COLUMN market TEXT NOT NULL DEFAULT 'CN'");
+                log.info("[DB迁移] t_user 表已添加 market 列");
+            }
+        } catch (SQLException e) {
+            // 列已存在时 SQLite 会抛出异常，忽略
+        } finally {
+            if (conn != null) { try { conn.close(); } catch (Exception ignore) {} }
+        }
+    }
+
     /** 启动时从数据库加载所有用户到内存缓存 */
     private void loadAll() {
         // 启动时确保新列存在（防止首次启动时 SELECT 失败）
         ensureWechatOpenIdColumn();
+        ensureMarketColumn();
         String sql = "SELECT user_id, username, password_hash, nickname, email, initial_capital, " +
                 "strategy_type, strategy_config, wechat_open_id, wechat_send_key, status, is_super_admin, " +
-                "create_time, last_login_time FROM t_user";
+                "create_time, last_login_time, market FROM t_user";
         // 使用独立短连接，避免与业务代码共享连接导致并发冲突
         Connection conn = null;
         try {
@@ -205,6 +223,13 @@ public class UserStore {
         String lt = rs.getString("last_login_time");
         if (lt != null && !lt.isEmpty()) {
             try { u.setLastLoginTime(LocalDateTime.parse(lt, DT_FMT)); } catch (Exception ignored) {}
+        }
+        // market 字段（HK=港股, CN=A股，默认CN）
+        try {
+            String market = rs.getString("market");
+            u.setMarket(market != null && !market.isEmpty() ? market : "CN");
+        } catch (Exception e) {
+            u.setMarket("CN");
         }
         return u;
     }

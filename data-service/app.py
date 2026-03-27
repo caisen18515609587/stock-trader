@@ -1315,7 +1315,7 @@ def _hk_emc_secid(code):
 @app.route('/hk_kline', methods=['GET'])
 def get_hk_kline():
     """
-    港股日K线数据（东方财富接口，免费，无需Token）
+    港股日K线数据（优先 Tushare，降级东方财富）
     参数:
       code  - 港股代码（如 00700，9988）
       start - 开始日期 yyyyMMdd，默认近1年
@@ -1338,57 +1338,90 @@ def get_hk_kline():
     if cached:
         return jsonify(cached)
 
-    # 东方财富复权：0=不复权 1=前复权 2=后复权
-    adj_map = {'none': 0, 'qfq': 1, 'hfq': 2}
-    fq = adj_map.get(adj, 1)
-
-    sec_ids = _hk_emc_secid(code)
     result = None
 
-    for secid in sec_ids:
-        url = (
-            f'https://push2his.eastmoney.com/api/qt/stock/kline/get'
-            f'?secid={secid}&ut=fa5fd1943c7b386f172d6893dbfba10b'
-            f'&fields1=f1,f2,f3,f4,f5,f6'
-            f'&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61'
-            f'&klt=101&fqt={fq}'  # klt=101 日线
-            f'&beg={start}&end={end}'
-            f'&_={int(time.time() * 1000)}'
-        )
-        try:
-            resp = _req.get(url, timeout=8,
-                            headers={'Referer': 'https://finance.eastmoney.com'})
-            data = resp.json()
-            klines = data.get('data', {})
-            if klines is None:
-                continue
-            klines = klines.get('klines', [])
-            if not klines:
-                continue
+    # ===== 方案1：Tushare 港股K线（稳定，有token，支持复权）=====
+    try:
+        # Tushare 港股代码格式：00700.HK
+        normalized = code.lstrip('0').zfill(5) if code.isdigit() else code.zfill(5)
+        ts_code = f'{normalized}.HK'
+        df = pro.hk_daily(ts_code=ts_code, start_date=start, end_date=end)
+        if df is not None and not df.empty:
             bars = []
-            for line in klines:
-                parts = line.split(',')
-                if len(parts) < 11:
-                    continue
+            for _, row in df.iterrows():
                 try:
                     bars.append({
-                        'date':       parts[0],
-                        'open':       safe_float(parts[1]),
-                        'close':      safe_float(parts[2]),
-                        'high':       safe_float(parts[3]),
-                        'low':        safe_float(parts[4]),
-                        'volume':     safe_int(parts[5]),
-                        'amount':     safe_float(parts[6]),
-                        'change_pct': safe_float(parts[8]),
-                        'change':     safe_float(parts[9]),
+                        'date':       str(row['trade_date']),  # yyyyMMdd 格式
+                        'open':       safe_float(row.get('open', 0)),
+                        'high':       safe_float(row.get('high', 0)),
+                        'low':        safe_float(row.get('low', 0)),
+                        'close':      safe_float(row.get('close', 0)),
+                        'volume':     safe_int(row.get('vol', 0)),
+                        'amount':     safe_float(row.get('amount', 0)),
+                        'change_pct': safe_float(row.get('pct_chg', 0)),
+                        'change':     safe_float(row.get('change', 0)),
                     })
                 except Exception:
                     pass
             if bars:
+                # Tushare 按日期降序返回，转为升序
+                bars.sort(key=lambda x: x['date'])
                 result = bars
-                break
-        except Exception as e:
-            log.debug(f'港股K线({secid})获取失败: {e}')
+                log.debug(f'[港股K线] Tushare 返回: {code} {len(bars)}条')
+    except Exception as e:
+        log.debug(f'[港股K线] Tushare 失败: {code} {e}')
+
+    # ===== 方案2：降级东方财富港股K线接口 =====
+    if result is None:
+        adj_map = {'none': 0, 'qfq': 1, 'hfq': 2}
+        fq = adj_map.get(adj, 1)
+        sec_ids = _hk_emc_secid(code)
+        for secid in sec_ids:
+            url = (
+                f'https://push2his.eastmoney.com/api/qt/stock/kline/get'
+                f'?secid={secid}&ut=fa5fd1943c7b386f172d6893dbfba10b'
+                f'&fields1=f1,f2,f3,f4,f5,f6'
+                f'&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61'
+                f'&klt=101&fqt={fq}'
+                f'&beg={start}&end={end}'
+                f'&_={int(time.time() * 1000)}'
+            )
+            try:
+                resp = _req.get(url, timeout=8,
+                                headers={'Referer': 'https://finance.eastmoney.com'})
+                data = resp.json()
+                klines = data.get('data', {})
+                if klines is None:
+                    continue
+                klines = klines.get('klines', [])
+                if not klines:
+                    continue
+                bars = []
+                for line in klines:
+                    parts = line.split(',')
+                    if len(parts) < 11:
+                        continue
+                    try:
+                        # 东方财富日期格式为 "2025-01-02"，转为 yyyyMMdd
+                        date_str = parts[0].replace('-', '')
+                        bars.append({
+                            'date':       date_str,
+                            'open':       safe_float(parts[1]),
+                            'close':      safe_float(parts[2]),
+                            'high':       safe_float(parts[3]),
+                            'low':        safe_float(parts[4]),
+                            'volume':     safe_int(parts[5]),
+                            'amount':     safe_float(parts[6]),
+                            'change_pct': safe_float(parts[8]),
+                            'change':     safe_float(parts[9]),
+                        })
+                    except Exception:
+                        pass
+                if bars:
+                    result = bars
+                    break
+            except Exception as e:
+                log.debug(f'港股K线({secid})获取失败: {e}')
 
     if result is None:
         log.warning(f'港股K线无数据: {code}')
