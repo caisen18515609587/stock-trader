@@ -90,14 +90,62 @@ public class TongHuaShunDataProvider implements StockDataProvider {
 
     @Override
     public StockBar getRealTimeQuote(String stockCode) {
+        boolean isHk = "HK".equals(detectExchange(stockCode));
+        // 港股大盘指数（如 HSI），直接用东财接口（新浪 hkHSI 格式字段数与个股不同）
+        if (isHk && stockCode.matches("[A-Za-z]+")) {
+            return getRealTimeQuoteHkIndexByEmc(stockCode);
+        }
         String fullCode = buildSinaCode(stockCode);
         String url = SINA_REALTIME_URL + fullCode;
-
         try {
             String body = httpGet(url);
-            return parseSinaQuote(stockCode, body);
+            return isHk ? parseSinaQuoteHk(stockCode, body) : parseSinaQuote(stockCode, body);
         } catch (Exception e) {
             log.error("获取实时行情失败: {}", stockCode, e);
+            return null;
+        }
+    }
+
+    /**
+     * 通过东方财富接口获取港股大盘指数实时行情（如恒生指数 HSI）
+     * 东财指数代码映射：HSI -> 116.HSI（需要查询东财的特定格式）
+     * 实际东财港股大盘指数 secid: 100.HSI
+     */
+    private StockBar getRealTimeQuoteHkIndexByEmc(String indexCode) {
+        try {
+            // 东财港股大盘指数市场代码为 100
+            String secId = "100." + indexCode.toUpperCase();
+            String url = String.format(
+                    "%s?secid=%s&ut=fa5fd1943c7b386f172d6893dbfba10b" +
+                    "&fields=f43,f57,f58,f170,f46,f47,f48,f49,f60&invt=2&fltt=2",
+                    EMC_REALTIME_URL, secId);
+            String body = httpGet(url);
+            com.fasterxml.jackson.databind.JsonNode root = objectMapper.readTree(body);
+            com.fasterxml.jackson.databind.JsonNode d = root.path("data");
+            if (d.isMissingNode() || d.isNull()) return null;
+            double current   = d.path("f43").asDouble(0) / 1000.0;
+            if (current <= 0) return null;
+            String name      = d.path("f58").asText(indexCode);
+            double prevClose = d.path("f60").asDouble(0) / 1000.0;
+            double change    = current - prevClose;
+            double changePct = prevClose > 0 ? change / prevClose * 100 : 0;
+            return StockBar.builder()
+                    .stockCode(indexCode)
+                    .stockName(name)
+                    .dateTime(LocalDateTime.now())
+                    .open(d.path("f46").asDouble(0) / 1000.0)
+                    .high(d.path("f44").asDouble(0) / 1000.0)
+                    .low(d.path("f45").asDouble(0) / 1000.0)
+                    .close(current)
+                    .volume(d.path("f47").asLong(0))
+                    .amount(d.path("f48").asDouble(0))
+                    .change(change)
+                    .changePercent(changePct)
+                    .period(StockBar.BarPeriod.DAILY)
+                    .adjustType(StockBar.AdjustType.NONE)
+                    .build();
+        } catch (Exception e) {
+            log.debug("东财港股大盘指数获取失败: {} ({})", indexCode, e.getMessage());
             return null;
         }
     }
@@ -119,7 +167,9 @@ public class TongHuaShunDataProvider implements StockDataProvider {
             String body = httpGet(url);
             String[] lines = body.split("\n");
             for (int i = 0; i < lines.length && i < stockCodes.size(); i++) {
-                StockBar bar = parseSinaQuote(stockCodes.get(i), lines[i]);
+                String code = stockCodes.get(i);
+                boolean isHk = "HK".equals(detectExchange(code));
+                StockBar bar = isHk ? parseSinaQuoteHk(code, lines[i]) : parseSinaQuote(code, lines[i]);
                 if (bar != null) results.add(bar);
             }
         } catch (Exception e) {
@@ -343,7 +393,161 @@ public class TongHuaShunDataProvider implements StockDataProvider {
     // =================== 私有辅助方法 ===================
 
     /**
-     * 解析新浪财经实时行情数据
+     * 解析新浪财经港股实时行情数据
+     * 接口格式（rt_hk02015）：
+     * var hq_str_rt_hk02015="中国铁建,0.000,50.700,50.700,51.250,50.000,50.650,50.700,
+     *   2567688,129812568.000,50.700,30800,50.650,22400,...,2026-03-27,16:01:57,+"
+     * 字段顺序（与A股不同）：
+     *  [0]  股票名称
+     *  [1]  不使用（tariff相关）
+     *  [2]  昨收
+     *  [3]  今开
+     *  [4]  最高
+     *  [5]  最低
+     *  [6]  买一价
+     *  [7]  卖一价
+     *  [8]  成交量（手）
+     *  [9]  成交额（港元）
+     *  [10] 现价
+     *  [...买卖五档...]
+     *  [倒数3] 日期（yyyy-MM-dd）
+     *  [倒数2] 时间（HH:mm:ss）
+     *  [倒数1] 涨跌方向（+/-）
+     */
+    private StockBar parseSinaQuoteHk(String stockCode, String rawData) {
+        try {
+            int start = rawData.indexOf('"');
+            int end = rawData.lastIndexOf('"');
+            if (start < 0 || end <= start) return null;
+            String data = rawData.substring(start + 1, end);
+            if (data.isEmpty()) return null;
+
+            String[] parts = data.split(",");
+            if (parts.length < 11) return null;
+
+            String name        = parts[0];
+            double prevClose   = Double.parseDouble(parts[2]);  // 昨收
+            double open        = Double.parseDouble(parts[3]);  // 今开
+            double high        = Double.parseDouble(parts[4]);  // 最高
+            double low         = Double.parseDouble(parts[5]);  // 最低
+            double current     = Double.parseDouble(parts[10]); // 现价
+            long   volume      = (long) Double.parseDouble(parts[8]);  // 成交量（手，已是100股单位）
+            double amount      = Double.parseDouble(parts[9]);  // 成交额
+
+            double change        = current - prevClose;
+            double changePercent = prevClose > 0 ? change / prevClose * 100 : 0;
+
+            // 时间解析：倒数第3和第2字段
+            LocalDateTime dateTime = LocalDateTime.now(); // 默认当前时间（防止解析失败）
+            try {
+                String dateStr = parts[parts.length - 3];
+                String timeStr = parts[parts.length - 2].replace(":", "");
+                dateTime = LocalDateTime.parse(dateStr + timeStr,
+                        DateTimeFormatter.ofPattern("yyyy-MM-ddHHmmss"));
+            } catch (Exception ignored) { /* 时间解析失败时用当前时间 */ }
+
+            return StockBar.builder()
+                    .stockCode(stockCode)
+                    .stockName(name)
+                    .dateTime(dateTime)
+                    .open(open)
+                    .high(high)
+                    .low(low)
+                    .close(current)
+                    .volume(volume)
+                    .amount(amount)
+                    .change(change)
+                    .changePercent(changePercent)
+                    .period(StockBar.BarPeriod.DAILY)
+                    .adjustType(StockBar.AdjustType.NONE)
+                    .build();
+        } catch (Exception e) {
+            // 港股行情解析失败时降级用东方财富实时接口
+            log.debug("新浪港股行情解析失败，尝试东财降级: {} rawData={}", stockCode, rawData);
+            return getRealTimeQuoteHkFallback(stockCode);
+        }
+    }
+
+    /**
+     * 港股实时行情降级：通过东方财富实时接口获取
+     * 当新浪接口返回格式异常时（非交易时段、停牌等）调用
+     */
+    private StockBar getRealTimeQuoteHkFallback(String stockCode) {
+        try {
+            // 港股通用东财 116 市场
+            String normalizedCode = String.format("%05d", Integer.parseInt(stockCode));
+            String secId = "116." + normalizedCode;
+            String url = String.format(
+                    "%s?secid=%s&ut=fa5fd1943c7b386f172d6893dbfba10b" +
+                    "&fields=f43,f57,f58,f170,f46,f47,f48,f49,f60&invt=2&fltt=2",
+                    EMC_REALTIME_URL, secId);
+            String body = httpGet(url);
+            com.fasterxml.jackson.databind.JsonNode root = objectMapper.readTree(body);
+            com.fasterxml.jackson.databind.JsonNode d = root.path("data");
+            if (d.isMissingNode()) return null;
+            double current    = d.path("f43").asDouble(0) / 1000.0;  // 东财价格放大1000倍
+            String name       = d.path("f58").asText("");
+            double prevClose  = d.path("f60").asDouble(0) / 1000.0;
+            double open       = d.path("f46").asDouble(0) / 1000.0;
+            double high       = d.path("f44").asDouble(0) / 1000.0;
+            double low        = d.path("f45").asDouble(0) / 1000.0;
+            long   volume     = d.path("f47").asLong(0);
+            double amount     = d.path("f48").asDouble(0);
+            double change     = current - prevClose;
+            double changePct  = prevClose > 0 ? change / prevClose * 100 : 0;
+            if (current <= 0) return null;
+            return StockBar.builder()
+                    .stockCode(stockCode)
+                    .stockName(name.isEmpty() ? stockCode : name)
+                    .dateTime(LocalDateTime.now())
+                    .open(open).high(high).low(low).close(current)
+                    .volume(volume).amount(amount)
+                    .change(change).changePercent(changePct)
+                    .period(StockBar.BarPeriod.DAILY)
+                    .adjustType(StockBar.AdjustType.NONE)
+                    .build();
+        } catch (Exception e) {
+            log.debug("东财港股实时行情降级失败: {}", stockCode);
+            return null;
+        }
+    }
+
+    /**
+     * 获取港股股票列表（东方财富港股通/港交所）
+     * 东财市场代码：116 = 港股通（沪、深双向），128 = 港交所原生
+     */
+    public List<Stock> getAllHkStocks() {
+        List<Stock> result = new ArrayList<>();
+        // 拉取港股通（南向），市场标识 m:128+t:3（港交所主板）
+        String url = "https://push2.eastmoney.com/api/qt/clist/get?" +
+                "pn=1&pz=3000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2" +
+                "&fid=f3&fs=m:128+t:3,m:128+t:4" +
+                "&fields=f12,f14,f2,f3&_=" + System.currentTimeMillis();
+        try {
+            String body = httpGet(url);
+            com.fasterxml.jackson.databind.JsonNode root = objectMapper.readTree(body);
+            com.fasterxml.jackson.databind.JsonNode items = root.path("data").path("diff");
+            if (items.isArray()) {
+                for (com.fasterxml.jackson.databind.JsonNode item : items) {
+                    String code = item.path("f12").asText();
+                    String name = item.path("f14").asText();
+                    if (code.isEmpty() || name.isEmpty()) continue;
+                    result.add(Stock.builder()
+                            .code(code).name(name)
+                            .exchange("HK")
+                            .status(Stock.StockStatus.NORMAL)
+                            .build());
+                }
+            }
+            log.info("获取港股列表成功，共{}只", result.size());
+        } catch (Exception e) {
+            log.error("获取港股列表失败", e);
+        }
+        return result;
+    }
+
+    /**
+     * 解析新浪财经A股实时行情数据
      * 格式：var hq_str_sh600519="贵州茅台,1720.00,1710.00,1730.00,1745.00,1715.00,1729.98,1730.00,
      *        68163,1189817928.00,..."
      */
@@ -462,14 +666,24 @@ public class TongHuaShunDataProvider implements StockDataProvider {
      * 港股: 02015 -> rt_hk02015
      */
     private String buildSinaCode(String code) {
-        if (code.startsWith("sh") || code.startsWith("sz") || code.startsWith("bj") || code.startsWith("rt_hk")) {
+        if (code.startsWith("sh") || code.startsWith("sz") || code.startsWith("bj")
+                || code.startsWith("rt_hk") || code.startsWith("hk")) {
             return code;
+        }
+        // 港股大盘指数：纯字母代码如 HSI、HSCEI -> 直接构建为 hkHSI 格式（新浪接口格式）
+        if (code.matches("[A-Za-z]+")) {
+            return "hk" + code.toUpperCase();
         }
         String exchange = detectExchange(code);
         if ("HK".equals(exchange)) {
-            // 港股补齐5位
-            String normalizedCode = String.format("%05d", Integer.parseInt(code));
-            return "rt_hk" + normalizedCode;
+            try {
+                // 港股个股补齐5位
+                String normalizedCode = String.format("%05d", Integer.parseInt(code));
+                return "rt_hk" + normalizedCode;
+            } catch (NumberFormatException e) {
+                // 港股指数等非数字代码
+                return "hk" + code.toUpperCase();
+            }
         }
         return exchange.toLowerCase() + code;
     }

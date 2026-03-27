@@ -1299,6 +1299,226 @@ def get_capital_flow_batch():
     return jsonify(result)
 
 
+# ========== 港股行情接口 ==========
+
+def _hk_emc_secid(code):
+    """
+    港股代码转东方财富 secid 格式
+    市场：116 = 港股通（沪深双向），128 = 港交所原生主板
+    优先用 116（港股通），数据更稳定；若无数据再降级到 128
+    """
+    # 补齐5位
+    normalized = code.zfill(5)
+    return f'116.{normalized}', f'128.{normalized}'
+
+
+@app.route('/hk_kline', methods=['GET'])
+def get_hk_kline():
+    """
+    港股日K线数据（东方财富接口，免费，无需Token）
+    参数:
+      code  - 港股代码（如 00700，9988）
+      start - 开始日期 yyyyMMdd，默认近1年
+      end   - 结束日期 yyyyMMdd，默认今天
+      adj   - 复权类型：none（不复权）/ qfq（前复权）/ hfq（后复权），默认 qfq
+    返回: [{date, open, high, low, close, volume, amount, change_pct}, ...]
+    """
+    import requests as _req
+
+    code  = request.args.get('code', '')
+    start = request.args.get('start', (datetime.now() - timedelta(days=365)).strftime('%Y%m%d'))
+    end   = request.args.get('end', datetime.now().strftime('%Y%m%d'))
+    adj   = request.args.get('adj', 'qfq')
+
+    if not code:
+        return jsonify({'error': '缺少code参数'}), 400
+
+    cache_key = f'hk_kline_{code}_{start}_{end}_{adj}'
+    cached = cache_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    # 东方财富复权：0=不复权 1=前复权 2=后复权
+    adj_map = {'none': 0, 'qfq': 1, 'hfq': 2}
+    fq = adj_map.get(adj, 1)
+
+    sec_ids = _hk_emc_secid(code)
+    result = None
+
+    for secid in sec_ids:
+        url = (
+            f'https://push2his.eastmoney.com/api/qt/stock/kline/get'
+            f'?secid={secid}&ut=fa5fd1943c7b386f172d6893dbfba10b'
+            f'&fields1=f1,f2,f3,f4,f5,f6'
+            f'&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61'
+            f'&klt=101&fqt={fq}'  # klt=101 日线
+            f'&beg={start}&end={end}'
+            f'&_={int(time.time() * 1000)}'
+        )
+        try:
+            resp = _req.get(url, timeout=8,
+                            headers={'Referer': 'https://finance.eastmoney.com'})
+            data = resp.json()
+            klines = data.get('data', {})
+            if klines is None:
+                continue
+            klines = klines.get('klines', [])
+            if not klines:
+                continue
+            bars = []
+            for line in klines:
+                parts = line.split(',')
+                if len(parts) < 11:
+                    continue
+                try:
+                    bars.append({
+                        'date':       parts[0],
+                        'open':       safe_float(parts[1]),
+                        'close':      safe_float(parts[2]),
+                        'high':       safe_float(parts[3]),
+                        'low':        safe_float(parts[4]),
+                        'volume':     safe_int(parts[5]),
+                        'amount':     safe_float(parts[6]),
+                        'change_pct': safe_float(parts[8]),
+                        'change':     safe_float(parts[9]),
+                    })
+                except Exception:
+                    pass
+            if bars:
+                result = bars
+                break
+        except Exception as e:
+            log.debug(f'港股K线({secid})获取失败: {e}')
+
+    if result is None:
+        log.warning(f'港股K线无数据: {code}')
+        return jsonify([])
+
+    cache_set(cache_key, result, ttl=CACHE_TTL_LONG)
+    return jsonify(result)
+
+
+@app.route('/hk_realtime', methods=['GET'])
+def get_hk_realtime():
+    """
+    港股实时行情（东方财富接口，免费，无需Token）
+    参数:
+      code  - 港股代码（如 00700，支持逗号分隔批量，如 00700,09988）
+    返回: {code, name, price, change, change_pct, open, high, low,
+           prev_close, volume, amount, update_time}
+    或批量: [{...}, ...]
+    """
+    import requests as _req
+
+    codes_raw = request.args.get('code', '')
+    if not codes_raw:
+        return jsonify({'error': '缺少code参数'}), 400
+
+    codes = [c.strip() for c in codes_raw.split(',') if c.strip()]
+    cache_key = f'hk_rt_{codes_raw}'
+    cached = cache_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    def _fetch_one(code):
+        sec_ids = _hk_emc_secid(code)
+        for secid in sec_ids:
+            url = (
+                f'https://push2.eastmoney.com/api/qt/stock/get'
+                f'?secid={secid}&ut=fa5fd1943c7b386f172d6893dbfba10b'
+                f'&fields=f43,f57,f58,f44,f45,f46,f47,f48,f60,f170&invt=2&fltt=2'
+                f'&_={int(time.time() * 1000)}'
+            )
+            try:
+                resp = _req.get(url, timeout=5,
+                                headers={'Referer': 'https://finance.eastmoney.com'})
+                d = resp.json().get('data', None)
+                if not d:
+                    continue
+                price      = safe_float(d.get('f43', 0)) / 1000.0
+                if price <= 0:
+                    continue
+                prev_close = safe_float(d.get('f60', 0)) / 1000.0
+                change     = price - prev_close
+                change_pct = (change / prev_close * 100) if prev_close > 0 else 0
+                return {
+                    'code':        code,
+                    'name':        d.get('f58', code),
+                    'price':       price,
+                    'change':      round(change, 4),
+                    'change_pct':  round(change_pct, 4),
+                    'open':        safe_float(d.get('f46', 0)) / 1000.0,
+                    'high':        safe_float(d.get('f44', 0)) / 1000.0,
+                    'low':         safe_float(d.get('f45', 0)) / 1000.0,
+                    'prev_close':  prev_close,
+                    'volume':      d.get('f47', 0),
+                    'amount':      safe_float(d.get('f48', 0)),
+                    'update_time': datetime.now().strftime('%H:%M:%S'),
+                }
+            except Exception as e:
+                log.debug(f'港股实时({secid})失败: {e}')
+        return None
+
+    results = []
+    for code in codes:
+        item = _fetch_one(code)
+        if item:
+            results.append(item)
+
+    if not results:
+        return jsonify({'error': '港股行情获取失败，请检查代码'}), 404
+
+    # 单个时返回 dict，批量时返回 list
+    output = results[0] if len(results) == 1 else results
+    cache_set(cache_key, output, ttl=10)   # 实时数据缓存10秒
+    return jsonify(output)
+
+
+@app.route('/hk_stock_list', methods=['GET'])
+def get_hk_stock_list():
+    """
+    港股股票列表（东方财富港股通主板，免费接口）
+    返回: [{code, name, price, change_pct}, ...]
+    约3000只港交所主板股票
+    """
+    import requests as _req
+
+    cache_key = 'hk_stock_list'
+    cached = cache_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    url = (
+        'https://push2.eastmoney.com/api/qt/clist/get'
+        '?pn=1&pz=3000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2'
+        '&fid=f3&fs=m:128+t:3,m:128+t:4'
+        '&fields=f12,f14,f2,f3'
+        f'&_={int(time.time() * 1000)}'
+    )
+    try:
+        resp = _req.get(url, timeout=10,
+                        headers={'Referer': 'https://finance.eastmoney.com'})
+        items = resp.json().get('data', {}).get('diff', [])
+        result = []
+        for item in (items or []):
+            code = item.get('f12', '')
+            name = item.get('f14', '')
+            if not code or not name:
+                continue
+            result.append({
+                'code':       code,
+                'name':       name,
+                'price':      safe_float(item.get('f2', 0)) / 1000.0,
+                'change_pct': safe_float(item.get('f3', 0)),
+            })
+        cache_set(cache_key, result, ttl=CACHE_TTL_LONG)
+        log.info(f'港股列表获取成功，共{len(result)}只')
+        return jsonify(result)
+    except Exception as e:
+        log.error(f'港股列表获取失败: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
 # ========== 启动 ==========
 if __name__ == '__main__':
     log.info('=' * 50)
@@ -1307,19 +1527,23 @@ if __name__ == '__main__':
     log.info(f'  Tushare Token: {TUSHARE_TOKEN[:8]}...')
     log.info('  接口列表:')
     log.info(f'    GET /health            - 健康检查')
-    log.info(f'    GET /kline             - 日K线数据')
-    log.info(f'    GET /realtime          - 实时行情')
-    log.info(f'    GET /stock_list        - 全量股票列表')
-    log.info(f'    GET /batch_realtime    - 批量实时行情')
+    log.info(f'    GET /kline             - A股日K线数据')
+    log.info(f'    GET /realtime          - A股实时行情')
+    log.info(f'    GET /stock_list        - A股全量股票列表')
+    log.info(f'    GET /batch_realtime    - A股批量实时行情')
     log.info(f'    GET /market_daily      - 全市场日行情')
-    log.info(f'    GET /auction_realtime  - 集合竞价实时行情（新浪实时源，绕过Tushare）')
-log.info(f'    GET /fundamental       - 单股基本面因子')
-log.info(f'    POST /fundamental_batch - 批量基本面因子')
-log.info(f'    GET /suspend           - 当日停牌股票列表（Tushare 120积分）')
-log.info(f'    GET /zt_pool          - 当日涨停板池（AKShare 免费）')
-log.info(f'    GET /news             - 市场财经新闻列表')
-log.info(f'    GET /stock_news       - 个股新闻（含情感分析）')
-log.info(f'    GET /capital_flow     - 主力资金流向（AKShare 免费）')
-log.info('=' * 50)
-app.run(host='0.0.0.0', port=SERVICE_PORT, debug=False)
+    log.info(f'    GET /auction_realtime  - 集合竞价实时行情（新浪实时源）')
+    log.info(f'    GET /fundamental       - 单股基本面因子')
+    log.info(f'    POST /fundamental_batch - 批量基本面因子')
+    log.info(f'    GET /suspend           - 当日停牌股票列表')
+    log.info(f'    GET /zt_pool           - 当日涨停板池（AKShare）')
+    log.info(f'    GET /news              - 市场财经新闻列表')
+    log.info(f'    GET /stock_news        - 个股新闻（含情感分析）')
+    log.info(f'    GET /capital_flow      - 主力资金流向（AKShare）')
+    log.info(f'  ---- 港股专属接口 ----')
+    log.info(f'    GET /hk_kline          - 港股日K线（东方财富，免费）')
+    log.info(f'    GET /hk_realtime       - 港股实时行情（东方财富，免费）')
+    log.info(f'    GET /hk_stock_list     - 港股股票列表（港交所主板，约3000只）')
+    log.info('=' * 50)
+    app.run(host='0.0.0.0', port=SERVICE_PORT, debug=False)
 

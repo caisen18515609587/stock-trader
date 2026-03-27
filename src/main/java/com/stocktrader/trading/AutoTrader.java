@@ -52,11 +52,23 @@ public class AutoTrader {
     // 交易报告目录
     private String reportDir;
 
-    // 交易时段
-    private static final LocalTime MARKET_OPEN = LocalTime.of(9, 30);
-    private static final LocalTime MARKET_CLOSE = LocalTime.of(15, 0);
-    private static final LocalTime NOON_BREAK_START = LocalTime.of(11, 30);
-    private static final LocalTime NOON_BREAK_END = LocalTime.of(13, 0);
+    // ===== A 股交易时段（默认）=====
+    private static final LocalTime MARKET_OPEN        = LocalTime.of(9, 30);
+    private static final LocalTime MARKET_CLOSE       = LocalTime.of(15, 0);
+    private static final LocalTime NOON_BREAK_START   = LocalTime.of(11, 30);
+    private static final LocalTime NOON_BREAK_END     = LocalTime.of(13, 0);
+
+    // ===== 港股交易时段（HKex：09:30~16:00，无午休）=====
+    private static final LocalTime HK_MARKET_OPEN     = LocalTime.of(9, 30);
+    private static final LocalTime HK_MARKET_CLOSE    = LocalTime.of(16, 0);
+
+    /**
+     * 当前监控池是否以港股为主。
+     * 在 refreshWatchlist() 或首次建池后根据 watchlist 中股票所属交易所动态更新。
+     * true -> 使用港股时段（09:30~16:00，无午休）+ 恒生指数作为大盘基准
+     * false -> 使用A股时段（09:30~15:00，11:30~13:00午休）+ 上证指数
+     */
+    private volatile boolean hkMode = false;
 
     private final StockDataProvider dataProvider;
     private final StockScreener screener;
@@ -206,7 +218,7 @@ public class AutoTrader {
     private static final int SWAP_MIN_QUALIFY_DAYS = 3;
 
     // ===== 大盘择时过滤 =====
-    /** 上证指数代码（用于大盘趋势判断） */
+    /** 上证指数代码（A股大盘趋势判断） */
     private static final String MARKET_INDEX_CODE = "000001";
     /**
      * [P2-2 优化] 沪深300指数代码，用于与上证指数做交叉验证。
@@ -214,6 +226,12 @@ public class AutoTrader {
      * 若两者只有一个满足（如上证震荡但沪深300仍较强），则不触发弱势拦截，降低误触发率。
      */
     private static final String CSI300_INDEX_CODE = "000300";
+    /**
+     * 恒生指数代码（港股大盘趋势判断）
+     * 东方财富/新浪均支持 ^HSI 或内部代码 HSI，这里用新浪格式前缀 hkHSI
+     * 注：在 buildSinaCode 中港股大盘指数代码直接透传，无需加市场前缀
+     */
+    private static final String HSI_INDEX_CODE = "HSI";
     /** 大盘当日跌幅超过此值时暂停全部新开仓（-1.5%，系统性风险高）*/
     private static final double MARKET_DROP_THRESHOLD = -0.015;
     /**
@@ -631,13 +649,13 @@ public class AutoTrader {
                     DayOfWeek dow = LocalDate.now().getDayOfWeek();
 
                     if (dow == DayOfWeek.SATURDAY || dow == DayOfWeek.SUNDAY) return;
-                    if (now.isBefore(MARKET_OPEN) || now.isAfter(MARKET_CLOSE)) return;
-                    if (now.isAfter(NOON_BREAK_START) && now.isBefore(NOON_BREAK_END)) return;
+                    if (!isInTradingHours(now)) return;
 
                     runOneScan();
 
                     // 收盘时保存日报 + 每日重新选股（只触发一次）
-                    if (now.isAfter(LocalTime.of(14, 55)) && now.isBefore(LocalTime.of(15, 2))) {
+                    LocalTime closeTime = hkMode ? HK_MARKET_CLOSE : MARKET_CLOSE;
+                    if (now.isAfter(closeTime.minusMinutes(3)) && now.isBefore(closeTime.plusMinutes(2))) {
                         if (!postMarketOptRunToday) {
                             postMarketOptRunToday = true;
                             log.info("[收盘] 保存当日汇总报告...");
@@ -682,25 +700,23 @@ public class AutoTrader {
                     return;
                 }
 
-                // 非交易时段不扫描
-                if (now.isBefore(MARKET_OPEN) || now.isAfter(MARKET_CLOSE)) {
-                    log.info("[{}] 当前非交易时段（{}~{}），等待开市",
-                            now.format(TIME_FMT), MARKET_OPEN, MARKET_CLOSE);
-                    return;
-                }
-
-                // 午休不扫描
-                if (now.isAfter(NOON_BREAK_START) && now.isBefore(NOON_BREAK_END)) {
-                    log.info("[{}] 午休时间（{}~{}），暂停扫描",
-                            now.format(TIME_FMT), NOON_BREAK_START, NOON_BREAK_END);
+                // 非交易时段不扫描（支持港股/A股时段自动切换）
+                if (!isInTradingHours(now)) {
+                    LocalTime mktOpen  = hkMode ? HK_MARKET_OPEN  : MARKET_OPEN;
+                    LocalTime mktClose = hkMode ? HK_MARKET_CLOSE : MARKET_CLOSE;
+                    log.info("[{}] 当前非交易时段（{}~{} {}），等待开市",
+                            now.format(TIME_FMT), mktOpen, mktClose,
+                            hkMode ? "港股" : "A股");
                     return;
                 }
 
                 runOneScan();
 
                 // 每天收盘后自动刷新选股池（下一交易日用新标的），同时保存当日汇总报告
-                if (now.isAfter(LocalTime.of(14, 50)) && now.isBefore(LocalTime.of(15, 5))) {
-                    log.info("[收盘] 保存当日汇总报告并刷新选股池...");
+                LocalTime closeTime2 = hkMode ? HK_MARKET_CLOSE : MARKET_CLOSE;
+                if (now.isAfter(closeTime2.minusMinutes(10)) && now.isBefore(closeTime2.plusMinutes(5))) {
+                    log.info("[收盘] 保存当日汇总报告并刷新选股池（{}）",
+                            hkMode ? "港股模式 16:00收盘" : "A股模式 15:00收盘");
                     saveDailySummaryReport();
                     sendDailySummaryPush();
                     refreshWatchlist();
@@ -755,6 +771,64 @@ public class AutoTrader {
     }
 
     /**
+     * 判断当前时刻是否处于交易时段。
+     * <p>
+     * - A股（hkMode=false）：09:30~11:30 + 13:00~15:00（有午休）
+     * - 港股（hkMode=true） ：09:30~16:00（无午休）
+     *
+     * @param now 当前本地时间
+     * @return true 表示在交易时段内
+     */
+    private boolean isInTradingHours(LocalTime now) {
+        if (hkMode) {
+            return !now.isBefore(HK_MARKET_OPEN) && !now.isAfter(HK_MARKET_CLOSE);
+        } else {
+            // A股：排除午休时段
+            if (now.isBefore(MARKET_OPEN) || now.isAfter(MARKET_CLOSE)) return false;
+            if (now.isAfter(NOON_BREAK_START) && now.isBefore(NOON_BREAK_END)) return false;
+            return true;
+        }
+    }
+
+    /**
+     * 根据当前 watchlist 的主要交易所，自动更新 hkMode 标志。
+     * <p>
+     * 规则：watchlist 中超过 50% 的股票属于港股（exchange=HK）时，切换到港股模式。
+     * 在 refreshWatchlist() 完成后调用。
+     */
+    private void updateHkMode() {
+        if (watchlist == null || watchlist.isEmpty()) return;
+        int hkCount = 0;
+        for (String code : watchlist) {
+            if (isHkCode(code)) hkCount++;
+        }
+        boolean newMode = hkCount > watchlist.size() / 2;
+        if (newMode != hkMode) {
+            hkMode = newMode;
+            log.info("[市场模式切换] {} → {} (港股{}只/共{}只)",
+                    newMode ? "A股" : "港股",
+                    newMode ? "港股" : "A股",
+                    hkCount, watchlist.size());
+        }
+    }
+
+    /**
+     * 判断股票代码是否属于港股（纯数字5位或4位，且不以6/0/3/4/8开头的A股规则）。
+     * 港股代码规则：数字串，通常0001~9999或00001~09999。
+     * 这里通过 TongHuaShunDataProvider.detectExchange 逻辑判断：
+     * - 纯数字且长度为4~5位 -> HK
+     * - 6位数字 -> A股
+     */
+    private boolean isHkCode(String code) {
+        if (code == null || code.isEmpty()) return false;
+        // 去除前缀
+        String c = code.replaceAll("^(hk|HK)", "");
+        if (!c.matches("\\d+")) return false;
+        int len = c.length();
+        return len >= 4 && len <= 5;
+    }
+
+    /**
      * 每分钟快速止损+清仓止盈检查（轻量级）
      * <p>
      * 仅拉取持仓股票的实时价格，不拉取历史K线，执行速度极快（每只股票约100ms）。
@@ -771,8 +845,7 @@ public class AutoTrader {
 
         // 周末或非交易时段跳过
         if (dow == DayOfWeek.SATURDAY || dow == DayOfWeek.SUNDAY) return;
-        if (now.isBefore(MARKET_OPEN) || now.isAfter(MARKET_CLOSE)) return;
-        if (now.isAfter(NOON_BREAK_START) && now.isBefore(NOON_BREAK_END)) return;
+        if (!isInTradingHours(now)) return;
 
         // 没有持仓，无需检查
         Map<String, Position> positions = portfolio.getPositions();
@@ -1263,8 +1336,10 @@ public class AutoTrader {
             return marketBearish;
         }
         try {
-            // 拉取上证指数实时行情
-            StockBar indexRt = dataProvider.getRealTimeQuote(MARKET_INDEX_CODE);
+            // [港股适配] 根据 hkMode 切换大盘基准指数
+            String primaryIndexCode = hkMode ? HSI_INDEX_CODE : MARKET_INDEX_CODE;
+            // 拉取大盘指数实时行情
+            StockBar indexRt = dataProvider.getRealTimeQuote(primaryIndexCode);
             if (indexRt == null || indexRt.getClose() <= 0) {
                 marketStatusLastUpdate = now;
                 return false; // 数据异常时不阻断交易
@@ -1273,60 +1348,76 @@ public class AutoTrader {
             double changePct = indexRt.getChangePercent();
             boolean todayBigDrop = changePct <= MARKET_DROP_THRESHOLD * 100;
 
-            // 判断条件2：[P2-2] 上证指数 MA5<MA20 且 沪深300 MA5<MA20（双指数交叉验证）
-            // 仅当两个指数均为空头排列时才触发，降低单指数噪音导致的误触发率
+            // 判断条件2：MA 趋势判断（港股 vs A股逻辑不同）
             boolean ma5BelowMa20 = false;
-            // [P0-2] 提升到 try 块外，供后续 marketDeepBearish 赋值使用
-            boolean sh000001DeepBearish = false; // MA5<MA20<MA60 三线空头
-            // [P0-2] indexBars 声明提升到 try 块外，供 updateMarketSentimentScore() 复用
+            boolean sh000001DeepBearish = false; // MA5<MA20<MA60 三线空头（A股 / 港股均复用此字段）
+            // indexBars 声明提升到 try 块外，供 updateMarketSentimentScore() 复用
             List<StockBar> indexBars = null;
             try {
                 LocalDate endDate = LocalDate.now();
                 LocalDate startDate = endDate.minusMonths(3);
-                // 上证指数 MA 判断（含 MA60 深度熊市检测）
-                boolean sh000001Bearish = false;
-                indexBars = dataProvider.getDailyBars(
-                        MARKET_INDEX_CODE, startDate, endDate, StockBar.AdjustType.NONE);
-                if (indexBars != null && indexBars.size() >= 20) {
-                    List<Double> closes = new ArrayList<>();
-                    for (StockBar b : indexBars) closes.add(b.getClose());
-                    double ma5  = com.stocktrader.analysis.TechnicalIndicator.sma(closes, 5);
-                    double ma20 = com.stocktrader.analysis.TechnicalIndicator.sma(closes, 20);
-                    if (ma5 > 0 && ma20 > 0) {
-                        sh000001Bearish = ma5 < ma20;
-                        // [P0-2] 计算 MA60：三线空头排列检测
-                        if (sh000001Bearish && closes.size() >= 60) {
-                            double ma60 = com.stocktrader.analysis.TechnicalIndicator.sma(closes, 60);
-                            if (ma60 > 0) {
-                                sh000001DeepBearish = ma20 < ma60; // MA5<MA20 已满足，再加 MA20<MA60
+
+                if (hkMode) {
+                    // ===== 港股模式：恒生指数单指数判断 =====
+                    indexBars = dataProvider.getDailyBars(
+                            HSI_INDEX_CODE, startDate, endDate, StockBar.AdjustType.NONE);
+                    if (indexBars != null && indexBars.size() >= 20) {
+                        List<Double> closes = new ArrayList<>();
+                        for (StockBar b : indexBars) closes.add(b.getClose());
+                        double ma5  = com.stocktrader.analysis.TechnicalIndicator.sma(closes, 5);
+                        double ma20 = com.stocktrader.analysis.TechnicalIndicator.sma(closes, 20);
+                        if (ma5 > 0 && ma20 > 0) {
+                            ma5BelowMa20 = ma5 < ma20;
+                            // 深度熊市：MA5<MA20<MA60
+                            if (ma5BelowMa20 && closes.size() >= 60) {
+                                double ma60 = com.stocktrader.analysis.TechnicalIndicator.sma(closes, 60);
+                                if (ma60 > 0) sh000001DeepBearish = ma20 < ma60;
                             }
                         }
                     }
-                }
-                // [P2-2] 沪深300交叉验证：仅当上证也弱时才请求沪深300，减少不必要请求
-                if (sh000001Bearish) {
-                    boolean csi300Bearish = false;
-                    try {
-                        List<StockBar> csi300Bars = dataProvider.getDailyBars(
-                                CSI300_INDEX_CODE, startDate, endDate, StockBar.AdjustType.NONE);
-                        if (csi300Bars != null && csi300Bars.size() >= 20) {
-                            List<Double> c300 = new ArrayList<>();
-                            for (StockBar b : csi300Bars) c300.add(b.getClose());
-                            double ma5c  = com.stocktrader.analysis.TechnicalIndicator.sma(c300, 5);
-                            double ma20c = com.stocktrader.analysis.TechnicalIndicator.sma(c300, 20);
-                            if (ma5c > 0 && ma20c > 0) {
-                                csi300Bearish = ma5c < ma20c;
+                    if (ma5BelowMa20) {
+                        log.info("[大盘择时-港股] 恒生指数 MA5<MA20，弱势行情，提高开仓门槛");
+                    }
+                } else {
+                    // ===== A股模式：上证+沪深300 双指数交叉验证 =====
+                    boolean sh000001Bearish = false;
+                    indexBars = dataProvider.getDailyBars(
+                            MARKET_INDEX_CODE, startDate, endDate, StockBar.AdjustType.NONE);
+                    if (indexBars != null && indexBars.size() >= 20) {
+                        List<Double> closes = new ArrayList<>();
+                        for (StockBar b : indexBars) closes.add(b.getClose());
+                        double ma5  = com.stocktrader.analysis.TechnicalIndicator.sma(closes, 5);
+                        double ma20 = com.stocktrader.analysis.TechnicalIndicator.sma(closes, 20);
+                        if (ma5 > 0 && ma20 > 0) {
+                            sh000001Bearish = ma5 < ma20;
+                            // [P0-2] 计算 MA60：三线空头排列检测
+                            if (sh000001Bearish && closes.size() >= 60) {
+                                double ma60 = com.stocktrader.analysis.TechnicalIndicator.sma(closes, 60);
+                                if (ma60 > 0) sh000001DeepBearish = ma20 < ma60;
                             }
                         }
-                    } catch (Exception e) {
-                        // 沪深300数据获取失败时降级：沿用上证单指数判断（保守处理）
-                        log.debug("[大盘择时] 沪深300K线获取失败，降级为上证单指数判断: {}", e.getMessage());
-                        csi300Bearish = true; // 保守处理：数据不可用时假定沪深300也弱
                     }
-                    // 双指数均弱才触发弱势拦截
-                    ma5BelowMa20 = csi300Bearish;
-                    if (sh000001Bearish && !csi300Bearish) {
-                        log.info("[大盘择时] 上证MA5<MA20但沪深300MA5>=MA20，两指数分化，不触发弱势拦截（降低误触发）");
+                    // [P2-2] 沪深300交叉验证：仅当上证也弱时才请求沪深300
+                    if (sh000001Bearish) {
+                        boolean csi300Bearish = false;
+                        try {
+                            List<StockBar> csi300Bars = dataProvider.getDailyBars(
+                                    CSI300_INDEX_CODE, startDate, endDate, StockBar.AdjustType.NONE);
+                            if (csi300Bars != null && csi300Bars.size() >= 20) {
+                                List<Double> c300 = new ArrayList<>();
+                                for (StockBar b : csi300Bars) c300.add(b.getClose());
+                                double ma5c  = com.stocktrader.analysis.TechnicalIndicator.sma(c300, 5);
+                                double ma20c = com.stocktrader.analysis.TechnicalIndicator.sma(c300, 20);
+                                if (ma5c > 0 && ma20c > 0) csi300Bearish = ma5c < ma20c;
+                            }
+                        } catch (Exception e) {
+                            log.debug("[大盘择时] 沪深300K线获取失败，降级为上证单指数判断: {}", e.getMessage());
+                            csi300Bearish = true;
+                        }
+                        ma5BelowMa20 = csi300Bearish;
+                        if (sh000001Bearish && !csi300Bearish) {
+                            log.info("[大盘择时] 上证MA5<MA20但沪深300MA5>=MA20，两指数分化，不触发弱势拦截");
+                        }
                     }
                 }
             } catch (Exception e) {
@@ -1335,22 +1426,25 @@ public class AutoTrader {
 
             cachedIndexChangePct = changePct;
             marketBearish = todayBigDrop || ma5BelowMa20;
-            // [P0-2] 深度熊市：MA5<MA20<MA60（三线空头排列），同时禁止换仓
-            // 条件：必须满足 ma5BelowMa20（双指数已验证弱势）且上证 MA20<MA60
+            // 深度熊市：MA5<MA20<MA60（三线空头排列），同时禁止换仓
             marketDeepBearish = ma5BelowMa20 && sh000001DeepBearish;
             marketStatusLastUpdate = now;
 
             // [P0-2] 更新大盘情绪综合评分（涨跌家数比 + 指数量能）
             updateMarketSentimentScore(indexBars);
 
+            String indexLabel = hkMode ? "恒生指数" : "上证/沪深300";
             if (marketDeepBearish) {
-                log.warn("[大盘择时-深度熊市] MA5<MA20<MA60 三线空头排列！当日涨跌幅={}%，暂停新开仓+禁止换仓（情绪分={}）",
+                log.warn("[大盘择时-深度熊市{}] MA5<MA20<MA60 三线空头！当日涨跌幅={}%，暂停新开仓+禁止换仓（情绪分={}）",
+                        hkMode ? "-港股" : "",
                         String.format("%.2f", changePct), marketSentimentScore);
             } else if (marketBearish) {
-                log.info("[大盘择时] 大盘风险预警：当日涨跌幅={} %，双指数MA5{}MA20，暂停新开仓（情绪分={}）",
-                        String.format("%.2f", changePct), ma5BelowMa20 ? "<" : ">=", marketSentimentScore);
+                log.info("[大盘择时-{}] 风险预警：当日涨跌幅={} %，MA5{}MA20，暂停新开仓（情绪分={}）",
+                        indexLabel, String.format("%.2f", changePct),
+                        ma5BelowMa20 ? "<" : ">=", marketSentimentScore);
             } else {
-                log.debug("[大盘情绪] 当日涨跌幅={}%，情绪综合评分={}", String.format("%.2f", changePct), marketSentimentScore);
+                log.debug("[大盘情绪-{}] 当日涨跌幅={}%，情绪综合评分={}",
+                        indexLabel, String.format("%.2f", changePct), marketSentimentScore);
             }
         } catch (Exception e) {
             log.debug("[大盘择时] 获取大盘行情异常，跳过择时过滤: {}", e.getMessage());
@@ -1407,10 +1501,22 @@ public class AutoTrader {
                         com.fasterxml.jackson.databind.JsonNode root = mapper.readTree(body);
                         com.fasterxml.jackson.databind.JsonNode items = root.path("data").path("diff");
                         if (items.isArray()) {
+                            int skipped = 0;
                             for (com.fasterxml.jackson.databind.JsonNode item : items) {
-                                double chgPct = item.path("f3").asDouble(0);
+                                com.fasterxml.jackson.databind.JsonNode f3Node = item.path("f3");
+                                // 东财接口在集合竞价期间/停牌时返回字符串"-"而非数字，
+                                // asDouble(0) 会把"-"解析为0导致统计失效，必须先判断类型
+                                if (!f3Node.isNumber()) {
+                                    skipped++;
+                                    continue; // 跳过停牌、集合竞价期间等无效值
+                                }
+                                double chgPct = f3Node.asDouble(0);
                                 if (chgPct > 0) upCount++;
                                 else if (chgPct < 0) downCount++;
+                            }
+                            if (skipped > 0) {
+                                log.debug("[P0-2情绪] 涨跌家数统计：跳过{}只无效数据（停牌/集合竞价），有效={}只",
+                                        skipped, upCount + downCount);
                             }
                         }
                     }
@@ -1421,12 +1527,23 @@ public class AutoTrader {
 
             // 涨跌比评分（0~100）
             int breadthScore = 50; // 默认中性
+            boolean breadthDataValid = false; // 涨跌家数数据是否有效
             int total = upCount + downCount;
             if (total >= 100) { // 至少100只股票才有统计意义
                 double upRatio = (double) upCount / total;
                 // 线性映射：[0.30, 0.65] → [0, 100]
                 breadthScore = (int) Math.round(Math.min(100, Math.max(0,
                         (upRatio - 0.30) / (0.65 - 0.30) * 100)));
+                breadthDataValid = true;
+            } else {
+                // 有效数据不足：常见于集合竞价阶段（9:15-9:25 东财 f3 字段返回"-"）
+                // 或非交易时段。此时涨跌比维度不参与评分，避免中性值50拖低精确度。
+                java.time.LocalTime now = java.time.LocalTime.now();
+                boolean isAuctionTime = now.isAfter(java.time.LocalTime.of(9, 14))
+                        && now.isBefore(java.time.LocalTime.of(9, 26));
+                log.debug("[P0-2情绪] 涨跌家数有效数量不足（上涨={}家 下跌={}家，有效={}/100）{}，跳过涨跌比维度",
+                        upCount, downCount, total,
+                        isAuctionTime ? "【集合竞价期间，数据属正常缺失】" : "【请检查东财接口返回】");
             }
 
             // ===== 维度2：指数量能（权重40%）=====
@@ -1449,14 +1566,25 @@ public class AutoTrader {
                 }
             }
 
-            // ===== 综合评分（涨跌比 60% + 量能 40%）=====
-            int newScore = (int) Math.round(breadthScore * 0.60 + volumeScore * 0.40);
+            // ===== 综合评分：动态权重 =====
+            // 涨跌家数有效时：涨跌比60% + 量能40%
+            // 涨跌家数无效时（集合竞价/非交易时段）：仅用量能100%，避免中性默认值50拉偏评分
+            int newScore;
+            if (breadthDataValid) {
+                newScore = (int) Math.round(breadthScore * 0.60 + volumeScore * 0.40);
+            } else {
+                newScore = volumeScore; // 仅量能维度
+            }
             int oldScore = marketSentimentScore;
             // 平滑处理：新值与旧值各取一半，避免单次数据抖动引发评分剧烈变化
             marketSentimentScore = (int) Math.round(newScore * 0.7 + oldScore * 0.3);
 
-            log.info("[P0-2情绪评分] 上涨={}家 下跌={}家 涨跌比分={} 量能分={} → 综合情绪分={}（上次={}）",
-                    upCount, downCount, breadthScore, volumeScore, marketSentimentScore, oldScore);
+            log.info("[P0-2情绪评分] 上涨={}家 下跌={}家{} 涨跌比分={} 量能分={} → 综合情绪分={}（上次={}，权重：{}）",
+                    upCount, downCount,
+                    breadthDataValid ? "" : "【家数数据无效，跳过此维度】",
+                    breadthDataValid ? breadthScore : "-",
+                    volumeScore, marketSentimentScore, oldScore,
+                    breadthDataValid ? "涨跌比60%+量能40%" : "仅量能100%");
 
         } catch (Exception e) {
             log.debug("[P0-2情绪] 更新情绪评分异常，保留上次评分({}): {}", marketSentimentScore, e.getMessage());
@@ -2826,6 +2954,8 @@ public class AutoTrader {
                 }
                 watchlist = new ArrayList<>(newWatch);
                 log.info("监控池更新（共{}只）：{}", watchlist.size(), watchlist);
+                // [港股适配] 根据监控池股票所属市场自动切换交易时段+大盘基准
+                updateHkMode();
             }
         } catch (Exception e) {
             log.error("刷新选股池失败: {}", e.getMessage(), e);

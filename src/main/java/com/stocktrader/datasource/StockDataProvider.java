@@ -67,7 +67,16 @@ public interface StockDataProvider {
     List<Stock> getAllAStocks();
 
     /**
-     * 搜索股票
+     * 获取港股股票列表（港股通+港交所主板）
+     * 默认实现返回空列表，支持港股的数据源可覆盖此方法。
+     * @return 港股列表
+     */
+    default List<Stock> getAllHkStocks() {
+        return new java.util.ArrayList<>();
+    }
+
+    /**
+     * 搜索股票（支持A股和港股代码/名称关键词）
      * @param keyword 关键词（代码或名称）
      * @return 匹配的股票列表
      */
